@@ -33,14 +33,22 @@ from care_data_quality import (
 )
 from patient_care_storage import (
     any_other_patient_has_local_reports,
+    delete_local_medication_reference,
     fetch_local_care_report_photo,
     fetch_local_care_reports,
     fetch_local_chat_thread,
+    fetch_local_medication_references,
     legacy_backfill_completed,
+    load_saved_caregiver_profiles,
     mark_legacy_backfill_completed,
+    purge_local_chat_messages,
     purge_local_internal_test_entries,
+    purge_local_care_reports,
+    save_caregiver_profiles,
     save_local_care_report,
     save_local_chat_thread,
+    update_local_medication_reference,
+    upsert_local_medication_reference,
 )
 
 logger = logging.getLogger("careshield")
@@ -291,20 +299,40 @@ def patient_names_match(active_name: str, document_name: str) -> bool:
     if not active_parts or not document_parts:
         return True
 
+    if active_parts == document_parts:
+        return True
+
+    def _first_names_align(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        shorter_len = min(len(left), len(right))
+        longer_len = max(len(left), len(right))
+        if shorter_len >= 1 and longer_len >= 2:
+            return left.startswith(right) or right.startswith(left)
+        return False
+
+    # Active profile uses a single name (e.g. "Peter") and document has full name.
+    if len(active_parts) == 1:
+        active_token = active_parts[0]
+        if _first_names_align(active_token, document_parts[0]):
+            return True
+        if len(document_parts) > 1 and active_token == document_parts[-1]:
+            return True
+        return False
+
+    # Document only extracted a first name against a fuller active profile.
+    if len(document_parts) == 1:
+        document_token = document_parts[0]
+        if _first_names_align(document_token, active_parts[0]):
+            return True
+        if len(active_parts) > 1 and document_token == active_parts[-1]:
+            return True
+        return False
+
     if active_parts[-1] != document_parts[-1]:
         return False
 
-    active_first = active_parts[0]
-    document_first = document_parts[0]
-    if active_first == document_first:
-        return True
-
-    shorter = min(len(active_first), len(document_first))
-    longer = max(len(active_first), len(document_first))
-    if shorter >= 1 and longer >= 2:
-        if active_first.startswith(document_first) or document_first.startswith(active_first):
-            return True
-    return False
+    return _first_names_align(active_parts[0], document_parts[0])
 
 
 def build_patient_name_mismatch_message(active_name: str, document_name: str) -> str:
@@ -417,9 +445,73 @@ def summary_matches_shift_log_patient(summary: str, patient_id) -> bool:
     return shift_log_patient_marker(resolved_id) in str(summary or "")
 
 
+def shift_log_belongs_to_patient(row: dict, patient_id) -> bool:
+    """True only when a shift_log row is explicitly or safely scoped to one patient."""
+    resolved_id = resolve_patient_id(patient_id)
+    if not resolved_id or not isinstance(row, dict):
+        return False
+
+    row_patient_id = row.get("patient_id")
+    if row_patient_id is not None and str(row_patient_id).strip():
+        return str(row_patient_id) == str(resolved_id)
+
+    summary = str(row.get("summary") or "")
+    if summary_matches_shift_log_patient(summary, resolved_id):
+        return True
+    if "[[patient:" in summary:
+        return False
+
+    try:
+        patients = list_account_patients()
+    except Exception:
+        patients = []
+    return len(patients) == 1 and str(patients[0].get("id")) == str(resolved_id)
+
+
 def strip_shift_log_patient_marker(summary: str) -> str:
     text = str(summary or "").strip()
     return _SHIFT_LOG_PATIENT_MARKER_RE.sub("", text).strip()
+
+
+_MEDCAM_PILL_SEGMENT_RE = re.compile(
+    r"([^:;]+):\s*x(\d+|\?)\s*\([^)]*\)",
+    re.I,
+)
+_MEDCAM_VERDICT_RE = re.compile(r"Verdict:\s*([^.]+)", re.I)
+
+
+def format_medcam_shift_log_for_timeline(summary: str) -> str:
+    """Turn internal MedCam shift-log summaries into caregiver-friendly timeline text."""
+    text = strip_shift_log_patient_marker(summary)
+    if not text:
+        return "MedCam medication check"
+    if "schedule=" not in text and "confidence" not in text.lower():
+        return text
+
+    pill_parts = []
+    for match in _MEDCAM_PILL_SEGMENT_RE.finditer(text):
+        med = match.group(1).strip()
+        count = match.group(2)
+        if count.isdigit() and int(count) == 1:
+            pill_parts.append(f"{med} (1 pill)")
+        elif count.isdigit():
+            pill_parts.append(f"{med} ({count} pills)")
+        else:
+            pill_parts.append(med)
+
+    verdict = ""
+    verdict_match = _MEDCAM_VERDICT_RE.search(text)
+    if verdict_match:
+        verdict = verdict_match.group(1).strip()
+
+    segments = ["MedCam check"]
+    if verdict:
+        segments.append(verdict)
+    if pill_parts:
+        segments.append(", ".join(pill_parts))
+    elif not verdict:
+        segments.append("Medication verified")
+    return " — ".join(segments)
 
 
 def _merge_care_report_rows(*groups: list) -> list:
@@ -461,6 +553,105 @@ def list_account_patients(account_id=None) -> list:
         return []
 
 
+def account_is_multi_patient(patient_id=None) -> bool:
+    """True when this family account has more than one patient profile."""
+    try:
+        if len(list_account_patients()) > 1:
+            return True
+    except Exception:
+        pass
+    patient_id = resolve_patient_id(patient_id)
+    if patient_id:
+        try:
+            return any_other_patient_has_local_reports(patient_id)
+        except Exception:
+            pass
+    return False
+
+
+_SHIFT_LOG_UTC_PREFIX = re.compile(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+UTC\]")
+
+
+def _parse_care_timestamp(raw) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def session_incident_is_valid_for_patient(incident: dict, patient_id=None) -> bool:
+    """In-memory session rows must not pre-date the patient profile or stale imports."""
+    if not isinstance(incident, dict):
+        return False
+    text = str(incident.get("text") or incident.get("summary") or "")
+    if _SHIFT_LOG_UTC_PREFIX.search(text):
+        return False
+    patient_id = resolve_patient_id(patient_id)
+    patient_row = get_patient_by_id(patient_id) if patient_id else None
+    moment = _parse_care_timestamp(incident.get("timestamp") or incident.get("reported_at"))
+    if patient_row and patient_row.get("created_at"):
+        patient_created = _parse_care_timestamp(patient_row["created_at"])
+        if patient_created and moment and moment < patient_created - timedelta(minutes=30):
+            return False
+    if moment:
+        age = datetime.now(timezone.utc) - moment
+        if age > timedelta(hours=36):
+            return False
+    return True
+
+
+def chat_thread_has_user_content(messages: list | None) -> bool:
+    """True when a chat thread contains at least one caregiver-typed report or question."""
+    return any(
+        isinstance(message, dict)
+        and message.get("role") == "user"
+        and str(message.get("content") or "").strip()
+        for message in messages or []
+    )
+
+
+def chat_thread_belongs_to_caregiver(messages: list | None, caregiver_id: str | None) -> bool:
+    """True when visible user messages were typed by the active caregiver profile."""
+    if not caregiver_id:
+        return True
+    user_messages = [
+        message
+        for message in messages or []
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and str(message.get("content") or "").strip()
+    ]
+    if not user_messages:
+        return True
+    tagged = [message for message in user_messages if message.get("caregiver_id")]
+    if not tagged:
+        return True
+    return all(str(message.get("caregiver_id") or "") == str(caregiver_id) for message in tagged)
+
+
+def chat_message_is_suspect_cross_profile(message: dict, patient_id=None) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = str(message.get("content") or "")
+    if "Connected to earlier reports" in content:
+        return True
+    if _SHIFT_LOG_UTC_PREFIX.search(content):
+        return True
+    patient_id = resolve_patient_id(patient_id)
+    patient_row = get_patient_by_id(patient_id) if patient_id else None
+    moment = _parse_care_timestamp(message.get("timestamp"))
+    if patient_row and patient_row.get("created_at"):
+        patient_created = _parse_care_timestamp(patient_row["created_at"])
+        if patient_created and moment and moment < patient_created - timedelta(minutes=30):
+            return True
+    return False
+
+
 def get_patient_by_id(patient_id) -> dict | None:
     patient_id_int = _patient_id_int(patient_id)
     if patient_id_int is None:
@@ -495,6 +686,69 @@ def get_patient_display_name(patient_id=None) -> str:
     if patient and patient.get("display_name"):
         return str(patient["display_name"])
     return "Patient"
+
+
+def _patient_name_tokens(active_patient_name: str) -> list[str]:
+    name = str(active_patient_name or "").strip()
+    if not name:
+        return []
+    parts = [part for part in re.split(r"\s+", name) if part]
+    tokens = []
+    for part in parts:
+        if part.lower() not in {token.lower() for token in tokens}:
+            tokens.append(part)
+    return tokens
+
+
+def extract_message_patient_name_candidates(user_text: str) -> list[str]:
+    """Personal names the caregiver typed that might refer to the patient."""
+    text = str(user_text or "").strip()
+    if not text:
+        return []
+    candidates = []
+    for pattern in (
+        r"(?i)\b([A-Za-z]{2,})(?:'s|'s)\b",
+        r"(?i)^\s*([A-Za-z]{2,})\s+(?:has|had|feels|is|was|looks|looked)\b",
+    ):
+        for match in re.finditer(pattern, text):
+            candidate = str(match.group(1) or "").strip()
+            if candidate and candidate.lower() not in {item.lower() for item in candidates}:
+                candidates.append(candidate)
+    return candidates
+
+
+def strip_leading_caregiver_name_prefix(text: str) -> str:
+    """Remove a leading 'Name's' caregiver shorthand from symptom report text."""
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^[A-Za-z]{2,}(?:'s|'s)\s+", "", cleaned)
+    cleaned = re.sub(r"^(?:the patient|patient)\s+", "", cleaned, flags=re.I)
+    return cleaned.strip()
+
+
+def enforce_active_patient_name_in_text(
+    text: str,
+    active_patient_name: str,
+    user_text: str = "",
+) -> str:
+    """Always surface the active profile name — never a mistyped name from caregiver text."""
+    result = str(text or "")
+    active_name = str(active_patient_name or "").strip()
+    if not result or not active_name:
+        return result
+
+    active_tokens = _patient_name_tokens(active_name)
+    active_first = active_tokens[0] if active_tokens else active_name
+
+    for candidate in extract_message_patient_name_candidates(user_text):
+        if candidate.lower() in {token.lower() for token in active_tokens}:
+            continue
+        for pattern, replacement in (
+            (rf"\b{re.escape(candidate)}(?:'s|'s)\b", f"{active_first}'s"),
+            (rf"\b{re.escape(candidate)}\b", active_first),
+        ):
+            result = re.sub(pattern, replacement, result, flags=re.I)
+
+    return result
 
 
 def create_patient(name: str, account_id=None) -> tuple[dict | None, str | None]:
@@ -606,6 +860,410 @@ def medications_to_display_rows(rows: list) -> list:
     return items
 
 
+RECENT_MED_ANNOTATION_RE = re.compile(
+    r"started\s+this\s+admission|started\s+(?:on|about|approx\.?)?\s*\d{1,2}|"
+    r"started\s+\d+\s+days?\s+ago|start(?:ed)?\s+date|date\s+started|"
+    r"newly\s+started|newly\s+prescribed|new\s+med(?:ication)?|"
+    r"this\s+admission|recent(?:ly)?\s+start(?:ed)?|"
+    r"began(?:\s+this)?|initiated|commenced|"
+    r"dose\s+chang(?:e|ed)|increased?\s+(?:to|dose)|decreased?\s+(?:to|dose)|"
+    r"new\s+prescription|first\s+dose|changed\s+to",
+    re.I,
+)
+
+NEXT_MED_ON_LINE_RE = re.compile(r",\s*(?=[A-Z][a-z]{2,}\b)")
+
+MEDICATION_SIDE_EFFECT_HINTS = (
+    (
+        r"dizz|light.?headed|vertigo|faint",
+        r"ace inhibitor|lisinopril|ramipril|enalapril|perindopril|captopril|"
+        r"beta.?blocker|bisoprolol|metoprolol|amlodipine|antihypertensive",
+        "Dizziness and light-headedness are known side effects of medicines like {name}.",
+    ),
+    (
+        r"fatigue|tired|letharg|weakness|exhausted",
+        r"ace inhibitor|lisinopril|ramipril|enalapril|beta.?blocker|bisoprolol|"
+        r"metoprolol|furosemide|diuretic|statin|atorvastatin|simvastatin",
+        "Fatigue or weakness can occur with {name}.",
+    ),
+    (
+        r"cough|dry cough",
+        r"ace inhibitor|lisinopril|ramipril|enalapril|perindopril|captopril",
+        "A persistent dry cough is a well-known side effect of ACE inhibitors such as {name}.",
+    ),
+    (
+        r"rash|hives|itch|skin reaction|urticaria",
+        r"penicillin|amoxicillin|sulfa|sulfonamide|cephalosporin|antibiotic",
+        "Skin reactions can be linked to medicines such as {name}.",
+    ),
+)
+
+
+def _medication_segment_on_line(line: str, med_name: str) -> str:
+    """Comma-delimited list segment — used for multi-medication lines only."""
+    line_clean = str(line or "").strip()
+    med_name = str(med_name or "").strip()
+    if not line_clean or not med_name:
+        return ""
+    line_lower = line_clean.lower()
+    name_lower = med_name.lower()
+    idx = line_lower.find(name_lower)
+    if idx < 0:
+        return ""
+    segment = line_clean[idx:]
+    comma_idx = segment.find(",", len(med_name))
+    if comma_idx > 0:
+        segment = segment[:comma_idx]
+    return segment.strip()
+
+
+def _medication_remainder_after_name(line: str, med_name: str) -> str:
+    line_clean = str(line or "").strip()
+    med_name = str(med_name or "").strip()
+    if not line_clean or not med_name:
+        return ""
+    line_lower = line_clean.lower()
+    name_lower = med_name.lower()
+    idx = line_lower.find(name_lower)
+    if idx < 0:
+        return ""
+    remainder = line_clean[idx + len(med_name):]
+    next_med = NEXT_MED_ON_LINE_RE.search(remainder)
+    if next_med:
+        remainder = remainder[:next_med.start()]
+    return remainder.strip(" ,;|-·")
+
+
+def _medication_bounded_tail(line: str, med_name: str) -> str:
+    line_clean = str(line or "").strip()
+    med_name = str(med_name or "").strip()
+    if not line_clean or not med_name:
+        return ""
+    line_lower = line_clean.lower()
+    name_lower = med_name.lower()
+    idx = line_lower.find(name_lower)
+    if idx < 0:
+        return ""
+    tail = line_clean[idx:]
+    next_med = NEXT_MED_ON_LINE_RE.search(tail[len(med_name):])
+    if next_med:
+        tail = tail[: len(med_name) + next_med.start()]
+    return tail.strip()
+
+
+def _medication_line_contexts(line: str, med_name: str) -> list[str]:
+    """Candidate spans on one line that may carry this medication's start/change note."""
+    line_clean = str(line or "").strip()
+    med_name = str(med_name or "").strip()
+    if not line_clean or not med_name:
+        return []
+    if med_name.lower() not in line_clean.lower():
+        return []
+
+    contexts = []
+    for candidate in (
+        _medication_segment_on_line(line_clean, med_name),
+        _medication_remainder_after_name(line_clean, med_name),
+        _medication_bounded_tail(line_clean, med_name),
+    ):
+        candidate = str(candidate or "").strip()
+        if candidate and candidate not in contexts:
+            contexts.append(candidate)
+    expanded = []
+    for context in contexts:
+        expanded.append(context)
+        for part in re.split(r"\s·\s", context):
+            part = part.strip()
+            if part and part not in expanded:
+                expanded.append(part)
+    return expanded
+
+
+def _line_indicates_med_recent_start(line: str, med_name: str) -> bool:
+    """True when a start/change annotation belongs to this medicine on the line."""
+    for context in _medication_line_contexts(line, med_name):
+        if RECENT_MED_ANNOTATION_RE.search(context):
+            return True
+    return False
+
+
+def _blob_links_med_to_annotation(blob: str, med_name: str, *, proximity: int = 140) -> bool:
+    """True when med name and a start annotation co-occur in the same dosage/plan blob."""
+    text = str(blob or "").strip()
+    med_name = str(med_name or "").strip()
+    if not text or not med_name:
+        return False
+    lower = text.lower()
+    name_lower = med_name.lower()
+    name_pos = lower.find(name_lower)
+    if name_pos < 0 or not RECENT_MED_ANNOTATION_RE.search(text):
+        return False
+    for line in re.split(r"[\n;]+", text):
+        if _line_indicates_med_recent_start(line, med_name):
+            return True
+    for match in RECENT_MED_ANNOTATION_RE.finditer(text):
+        if abs(match.start() - name_pos) <= proximity:
+            return True
+    return False
+
+
+def _plan_text_suggests_recent_start_for_med(raw_text: str, med_name: str) -> bool:
+    lines = str(raw_text or "").splitlines()
+    for index, line in enumerate(lines):
+        if _line_indicates_med_recent_start(line, med_name):
+            return True
+        if med_name.lower() in line.lower():
+            combined = line
+            if index + 1 < len(lines):
+                combined = f"{line} {lines[index + 1].strip()}"
+            if _line_indicates_med_recent_start(combined, med_name):
+                return True
+    return False
+
+
+def medication_symptom_context_blob(med: dict) -> str:
+    return " ".join(
+        str(med.get(key) or "")
+        for key in (
+            "name",
+            "medication_name",
+            "dosage",
+            "dosage_instructions",
+            "timing",
+            "schedule",
+            "notes",
+            "detail",
+            "change_notes",
+        )
+    )
+
+
+def medication_recent_start_signals(med: dict) -> list[str]:
+    """Explicit recent-start annotations only — never inferred from bulk upload timestamps."""
+    signals = []
+    med_name = str(med.get("name") or med.get("medication_name") or "").strip()
+    blob = medication_symptom_context_blob(med)
+
+    for line in re.split(r"[\n;]+", blob):
+        line_clean = re.sub(r"\s+", " ", line).strip()
+        if not line_clean:
+            continue
+        if med_name and _line_indicates_med_recent_start(line_clean, med_name):
+            if line_clean not in signals:
+                signals.append(line_clean[:120])
+        for part in re.split(r"\s·\s", line_clean):
+            part = part.strip()
+            if part and RECENT_MED_ANNOTATION_RE.search(part):
+                if med_name and (med_name.lower() in part.lower() or _blob_links_med_to_annotation(blob, med_name)):
+                    if part not in signals:
+                        signals.append(part[:120])
+
+    if med_name and not signals and _blob_links_med_to_annotation(blob, med_name):
+        match = RECENT_MED_ANNOTATION_RE.search(blob)
+        if match:
+            snippet = re.sub(r"\s+", " ", blob[max(0, match.start() - 40): match.end() + 40]).strip()
+            signals.append(snippet[:120])
+
+    for field in ("notes", "dosage_instructions", "change_notes", "detail"):
+        field_text = str(med.get(field) or "").strip()
+        if not field_text or not RECENT_MED_ANNOTATION_RE.search(field_text):
+            continue
+        if not med_name or med_name.lower() in field_text.lower() or _blob_links_med_to_annotation(blob, med_name):
+            snippet = re.sub(r"\s+", " ", field_text).strip()
+            if snippet and snippet not in signals:
+                signals.append(snippet[:120])
+
+    if med.get("is_recent_start") or med.get("recently_started"):
+        explicit = str(med.get("recent_start_note") or med.get("notes") or "").strip()
+        signals.append(explicit[:120] if explicit else "flagged as recently started or changed")
+    change_type = str(med.get("change_type") or "").strip().lower()
+    if change_type in {"start", "dose_change", "switch"}:
+        detail = str(med.get("change_detail") or med.get("detail") or "").strip()
+        signals.append(detail or f"medication {change_type.replace('_', ' ')} on file")
+    return signals[:4]
+
+
+def medication_has_explicit_recent_start(med: dict) -> bool:
+    return bool(medication_recent_start_signals(med))
+
+
+def _extract_med_recent_start_notes_from_text(raw_text: str, med_name: str) -> list[str]:
+    """Scan any clinical text blob (plan or uploaded document) for this med's start/change notes."""
+    notes = []
+    lines = str(raw_text or "").splitlines()
+    for index, line in enumerate(lines):
+        line_clean = line.strip()
+        contexts = [line_clean]
+        if index + 1 < len(lines):
+            contexts.append(f"{line_clean} {lines[index + 1].strip()}")
+        for context in contexts:
+            if not _line_indicates_med_recent_start(context, med_name):
+                continue
+            if context not in notes:
+                notes.append(context[:160])
+    return notes
+
+
+def _collect_medication_enrichment_texts(patient_id=None) -> list[str]:
+    """Plan raw_text plus uploaded document raw_text — same sources allergies already use."""
+    texts = []
+    seen = set()
+    plan = get_latest_patient_plan(patient_id)
+    if plan:
+        raw = str(plan.get("raw_text") or "").strip()
+        if raw:
+            texts.append(raw)
+            seen.add(raw)
+    for doc_text in fetch_patient_document_texts(patient_id):
+        doc_text = str(doc_text or "").strip()
+        if doc_text and doc_text not in seen:
+            texts.append(doc_text)
+            seen.add(doc_text)
+    return texts
+
+
+def _enrich_medications_from_clinical_notes(meds: list, patient_id=None) -> list:
+    source_texts = _collect_medication_enrichment_texts(patient_id)
+    if not source_texts:
+        return meds
+    enriched = []
+    for med in meds or []:
+        item = dict(med)
+        name = str(item.get("name") or "").strip()
+        if not name:
+            enriched.append(item)
+            continue
+        clinical_notes = []
+        for raw_text in source_texts:
+            for note in _extract_med_recent_start_notes_from_text(raw_text, name):
+                if note not in clinical_notes:
+                    clinical_notes.append(note)
+        if clinical_notes:
+            existing = str(item.get("notes") or "").strip()
+            merged = " | ".join(clinical_notes)
+            item["notes"] = f"{existing} | {merged}".strip(" |") if existing else merged
+            item["is_recent_start"] = True
+            item["recent_start_note"] = clinical_notes[0]
+        enriched.append(item)
+    return enriched
+
+
+def _enrich_medications_from_plan_notes(meds: list, patient_id=None) -> list:
+    """Backward-compatible alias — enrichment now scans plan + uploaded documents."""
+    return _enrich_medications_from_clinical_notes(meds, patient_id)
+
+
+def _log_medication_recent_start_scan(med: dict, clinical_hint_text: str = "") -> None:
+    med_name = str(med.get("name") or "").strip()
+    if not med_name:
+        return
+    signals = medication_recent_start_signals(med)
+    explicit = medication_has_explicit_recent_start(med)
+    clinical_hint = bool(
+        clinical_hint_text and _plan_text_suggests_recent_start_for_med(clinical_hint_text, med_name)
+    )
+    if clinical_hint and not explicit:
+        logger.warning(
+            "Medication recent-start miss: %s — clinical notes suggest a start/change annotation but no explicit flag was derived",
+            med_name,
+        )
+    elif explicit:
+        logger.info(
+            "Medication recent-start detected: %s signals=%s",
+            med_name,
+            signals,
+        )
+    else:
+        logger.debug("Medication recent-start scan: %s explicit=false", med_name)
+
+
+def medications_to_symptom_context_rows(rows: list, patient_id=None) -> list:
+    clinical_hint_text = "\n".join(_collect_medication_enrichment_texts(patient_id))
+    items = []
+    for row in _enrich_medications_from_clinical_notes(rows or [], patient_id):
+        parsed = parse_dosage_instructions(row.get("dosage_instructions"))
+        signals = medication_recent_start_signals(row)
+        item = {
+            "name": row.get("name", ""),
+            "dosage": parsed["dosage"] or row.get("dosage", ""),
+            "timing": parsed["timing"] or row.get("timing", ""),
+            "dosage_instructions": row.get("dosage_instructions", ""),
+            "notes": row.get("notes") or "",
+            "recent_start_signals": signals,
+            "is_recent_start": medication_has_explicit_recent_start(row),
+            "created_at": row.get("created_at"),
+        }
+        items.append(item)
+        _log_medication_recent_start_scan(row, clinical_hint_text)
+    return items
+
+
+def get_patient_medications_for_symptom_context(patient_id=None) -> list:
+    return medications_to_symptom_context_rows(get_patient_medications(patient_id), patient_id)
+
+
+_PRONOUN_LEAD_RE = re.compile(
+    r"^(?:he|she|they)\s+"
+    r"(?:woke up with|has|had|is|was|feels|felt|got|developed|complained of|reported)\s+",
+    re.I,
+)
+
+
+def _normalize_caregiver_symptom_phrase(text: str) -> str:
+    text = strip_leading_caregiver_name_prefix(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    letters = [char for char in text if char.isalpha()]
+    if letters and sum(char.isupper() for char in letters) / len(letters) >= 0.75:
+        text = text.lower()
+        text = text[0].upper() + text[1:] if text else text
+    text = _PRONOUN_LEAD_RE.sub("", text).strip()
+    return text
+
+
+def _canonical_symptom_label(symptom_text: str) -> str | None:
+    from symptom_linking import SYMPTOM_PATTERN_DEFINITIONS, extract_symptoms_from_text, _text_for_symptom_label_extraction
+
+    phrase = _text_for_symptom_label_extraction(symptom_text)
+    keys = extract_symptoms_from_text(phrase)
+    labels = {key: label for key, _pattern, label in SYMPTOM_PATTERN_DEFINITIONS}
+    for key in keys:
+        label = labels.get(key)
+        if not label:
+            continue
+        short = label.split(" (")[0].strip()
+        return short[0].lower() + short[1:] if short else None
+    return None
+
+
+def summarize_reported_symptom(symptom_text: str, active_patient_name: str = "") -> str:
+    phrase = _normalize_caregiver_symptom_phrase(symptom_text)
+    if not phrase:
+        return "this symptom"
+
+    canonical = _canonical_symptom_label(phrase)
+    sentence = re.split(r"[.!?;\n]", phrase, maxsplit=1)[0].strip()
+    if re.search(r"chest\s+tight(?:ness)?|tight\s+chest", sentence, re.I):
+        canonical = "chest tightness"
+    if len(sentence) > 90:
+        sentence = sentence[:87].rstrip() + "..."
+
+    active_first = _patient_name_tokens(active_patient_name)
+    if active_first:
+        first = active_first[0]
+        if canonical:
+            return f"{first}'s {canonical}"
+        if re.match(rf"^{re.escape(first)}(?:'s|'s)?\b", sentence, re.I):
+            return sentence
+        lowered = sentence[0].lower() + sentence[1:] if sentence else ""
+        return f"{first}'s {lowered}" if lowered else f"{first}'s reported symptom"
+
+    if canonical:
+        return canonical
+    return sentence or "this symptom"
+
+
 def get_patient_medications(patient_id=None) -> list:
     patient_id_int = _patient_id_int(patient_id)
     if patient_id_int is None:
@@ -627,30 +1285,54 @@ def get_patient_medications_display(patient_id=None) -> list:
     return medications_to_display_rows(get_patient_medications(patient_id))
 
 
+_CONDITION_SINCE_MISSING = frozenset({
+    "unknown",
+    "n/a",
+    "na",
+    "not stated",
+    "not documented",
+    "none",
+})
+
+
+def normalize_condition_since(value) -> str | None:
+    """Return a clean onset label, or None when the document did not state a date."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _CONDITION_SINCE_MISSING:
+        return None
+    return text
+
+
 def _condition_notes_to_fields(notes: str) -> dict:
     text = str(notes or "").strip()
     if not text:
-        return {"since": "Unknown", "badge": "chronic"}
+        return {"since": None, "badge": "chronic"}
     if text.startswith("{"):
         try:
             data = json.loads(text)
             return {
-                "since": data.get("since") or "Unknown",
+                "since": normalize_condition_since(data.get("since")),
                 "badge": data.get("badge") or "chronic",
             }
         except json.JSONDecodeError:
             pass
     if "|" in text:
         since, badge = text.split("|", 1)
-        return {"since": since.strip() or "Unknown", "badge": badge.strip() or "chronic"}
-    return {"since": text, "badge": "chronic"}
+        return {
+            "since": normalize_condition_since(since),
+            "badge": badge.strip() or "chronic",
+        }
+    return {"since": normalize_condition_since(text), "badge": "chronic"}
 
 
 def _condition_fields_to_notes(condition: dict) -> str:
-    return json.dumps({
-        "since": condition.get("since") or "Unknown",
-        "badge": condition.get("badge") or "chronic",
-    })
+    payload = {"badge": condition.get("badge") or "chronic"}
+    since = normalize_condition_since(condition.get("since"))
+    if since:
+        payload["since"] = since
+    return json.dumps(payload)
 
 
 def get_patient_conditions(patient_id=None) -> list:
@@ -668,8 +1350,8 @@ def get_patient_conditions(patient_id=None) -> list:
         return [
             {
                 "name": row.get("name", ""),
-                "since": _condition_notes_to_fields(row.get("notes")).get("since", "Unknown"),
-                "badge": _condition_notes_to_fields(row.get("notes")).get("badge", "chronic"),
+                "since": (fields := _condition_notes_to_fields(row.get("notes"))).get("since"),
+                "badge": fields.get("badge", "chronic"),
             }
             for row in (response.data or [])
             if row.get("name")
@@ -708,37 +1390,46 @@ def escalate_severity(current: str, proposed: str) -> str:
 
 SYMPTOM_CONDITION_CROSSCHECK_PROMPT = """You are a clinical safety assistant for family caregivers using CareShield.
 
-You receive a caregiver's new symptom report and the patient's stored chronic conditions from their medical record.
-Use your medical knowledge to decide whether this symptom is MORE dangerous for THIS patient because of ANY stored condition.
-Do not rely on a fixed rule list — reason dynamically about vulnerability, complications, and red-flag combinations for every condition provided.
+You receive a caregiver's new symptom report plus the patient's stored chronic conditions, current medications (with recent-start flags), and documented allergies.
+Use your medical knowledge to decide whether this symptom is MORE dangerous for THIS patient because of ANY stored condition, medication, or allergy.
+Do not rely on a fixed rule list — reason dynamically about vulnerability, complications, red-flag combinations, medication side effects, and allergic reactions.
 
-Examples (illustrative only — apply the same reasoning to any condition on file):
+Examples (illustrative only — apply the same reasoning to everything on file):
 - Fever + Type 1 Diabetes → infection/DKA risk; often needs urgent clinical review
-- Fever + COPD → respiratory infection and breathing-compromise risk
-- Fever + Chronic Kidney Disease → infection plus fluid/electrolyte and kidney-stress risk
+- Dizziness + recently started ACE inhibitor → likely medication side effect; contact GP
+- Rash or hives + documented penicillin allergy → possible allergic reaction; contact_doctor unless the report describes anaphylaxis red flags (breathing difficulty, facial/throat swelling, collapse) → then emergency
+- Fatigue + newly started diuretic or beta-blocker → consider medication-related cause
+
+ALLERGY SEVERITY RULES (critical):
+- A documented allergy alone NEVER warrants "emergency". Base severity on the REPORTED symptom words.
+- Mild/localized rash, hives, or itching with a known allergy on file → "contact_doctor" (not emergency).
+- Use "emergency" only when the caregiver's report itself describes anaphylaxis red flags: breathing difficulty, lip/tongue/throat/facial swelling, wheeze, fainting, collapse, or rapidly spreading whole-body reaction.
 
 Respond with ONLY a JSON object:
 {
-  "symptom_identified": "brief symptom label (e.g. fever, chest pain, confusion)",
-  "is_elevated_risk": boolean — true when ANY stored condition makes this symptom meaningfully more dangerous than in an otherwise healthy person,
+  "symptom_identified": "brief symptom label (e.g. fever, chest pain, confusion, leg swelling)",
+  "is_elevated_risk": boolean — true when ANY stored condition, medication, or allergy makes this symptom meaningfully more dangerous than in an otherwise healthy person,
   "recommended_severity": one of "ok", "monitor", "contact_doctor", "emergency",
   "needs_doctor": boolean — true when recommended_severity is "contact_doctor" or "emergency",
   "condition_risks": [
     {
-      "condition_name": "exact name from PATIENT CONDITIONS",
+      "condition_name": "exact name from PATIENT CONDITIONS, MEDICATIONS, or ALLERGIES",
       "is_relevant": boolean,
       "severity_impact": "none" | "monitor" | "contact_doctor" | "emergency",
-      "education_message": "How [Condition Name] Impacts This Symptom: [clear, calm explanation]" or null when not relevant
+      "education_message": "How [Name] Impacts This Symptom: [clear, calm explanation tailored to the REPORTED symptom]" or null when not relevant
     }
   ]
 }
 
 Rules for education_message (critical):
-- Include one object per stored condition; set is_relevant=true when that condition helps explain or changes the risk of this symptom — even if the symptom is mild.
-- When is_relevant=true, education_message MUST begin exactly with: "How [Condition Name] Impacts This Symptom: " using the condition_name from the list.
-- Explain how the reported symptom affects that specific condition and what dangerous risks the caregiver should watch for — educational, not panicked, no diagnosis.
-- ALWAYS mark is_relevant=true for obvious pairs (examples: joint stiffness + osteoarthritis; swelling + heart failure; unusual bruising when anticoagulants are on file; fever + diabetes/COPD/kidney disease).
-- If no conditions are on file OR none relate to the symptom: is_elevated_risk=false and all is_relevant=false.
+- Include objects for stored conditions AND for medications/allergies when they help explain this specific symptom.
+- When is_relevant=true, education_message MUST begin exactly with: "How [Name] Impacts This Symptom: " using the condition_name from the list.
+- Tailor every explanation to the reported symptom — never reuse generic boilerplate across different symptoms.
+- For medications with is_recent_start=true or recent_start_signals, explicitly note that a recent start or dose change makes side effects more likely.
+- For rash, hives, swelling, breathing difficulty, or skin reactions: ALWAYS review patient_allergies in the payload. If any allergy could explain the symptom, set is_relevant=true for that allergy and name it explicitly in education_message.
+- For medications: ONLY treat a medicine as recently started/changed when is_recent_start=true or recent_start_signals is non-empty in current_medications. Otherwise reason about it as an existing/stable medicine — never say "recently started" without that flag.
+- ALWAYS mark is_relevant=true for obvious pairs (examples: joint stiffness + osteoarthritis; swelling + heart failure; dizziness + recently started antihypertensive; rash + documented drug allergy).
+- If nothing on file relates to the symptom: is_elevated_risk=false and all is_relevant=false.
 """
 
 
@@ -753,7 +1444,7 @@ def build_patient_conditions_payload(patient_id=None) -> dict:
             {
                 "name": str(item.get("name") or "").strip(),
                 "status": str(item.get("badge") or "chronic").strip(),
-                "since": str(item.get("since") or "Unknown").strip(),
+                "since": normalize_condition_since(item.get("since")) or "",
             }
             for item in conditions
             if str(item.get("name") or "").strip()
@@ -830,6 +1521,7 @@ def build_symptom_condition_analysis_input(
     symptom_text: str,
     conditions_payload: dict,
     medications: list | None = None,
+    allergies: list | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -839,6 +1531,7 @@ def build_symptom_condition_analysis_input(
                 "conditions": conditions_payload.get("conditions") or [],
             },
             "current_medications": medications or [],
+            "patient_allergies": allergies or [],
         },
         ensure_ascii=False,
         indent=2,
@@ -849,9 +1542,11 @@ def analyze_symptom_against_conditions(
     symptom_text: str,
     patient_id=None,
     medications: list | None = None,
+    allergies: list | None = None,
 ) -> dict:
     """
-    Cross-check a reported symptom against the patient's stored chronic conditions.
+    Cross-check a reported symptom against the patient's stored conditions,
+    medications, and allergies.
     Returns structured severity guidance and caregiver education messages.
     """
     symptom_text = str(symptom_text or "").strip()
@@ -859,7 +1554,10 @@ def analyze_symptom_against_conditions(
         return normalize_symptom_condition_analysis({})
 
     payload = build_patient_conditions_payload(patient_id)
-    if not payload.get("conditions"):
+    meds = medications if medications is not None else get_patient_medications_for_symptom_context(patient_id)
+    allergy_list = allergies if allergies is not None else get_patient_allergy_notes(patient_id)
+    has_context = bool(payload.get("conditions") or meds or allergy_list)
+    if not has_context:
         return normalize_symptom_condition_analysis({
             "is_elevated_risk": False,
             "recommended_severity": "monitor",
@@ -868,28 +1566,42 @@ def analyze_symptom_against_conditions(
             "skipped": True,
         })
 
-    user_input = build_symptom_condition_analysis_input(symptom_text, payload, medications)
+    user_input = build_symptom_condition_analysis_input(
+        symptom_text,
+        payload,
+        meds,
+        allergy_list,
+    )
     result = ask_ai(SYMPTOM_CONDITION_CROSSCHECK_PROMPT, user_input)
     if result.get("error"):
         logger.warning("Symptom-condition cross-check failed: %s", result.get("message"))
-        return normalize_symptom_condition_analysis({
+        result = {
             "is_elevated_risk": False,
             "recommended_severity": "monitor",
             "needs_doctor": False,
             "condition_risks": [],
             "error": result.get("message"),
-        })
+        }
 
     normalized = normalize_symptom_condition_analysis(result)
     normalized = enrich_symptom_condition_analysis(
         symptom_text,
         normalized,
         payload.get("conditions") or [],
-        medications or [],
+        meds,
+        allergy_list,
+        active_patient_name=str(payload.get("patient_name") or ""),
     )
+    recent_med_names = [
+        str(item.get("name") or "")
+        for item in meds
+        if medication_has_explicit_recent_start(item)
+    ]
     logger.info(
-        "Symptom-condition cross-check: symptom=%s elevated=%s severity=%s relevant=%s",
+        "Symptom cross-check: symptom=%s allergies=%s recent_meds=%s elevated=%s severity=%s relevant=%s",
         normalized.get("symptom_identified") or symptom_text[:80],
+        allergy_list,
+        recent_med_names,
         normalized.get("is_elevated_risk"),
         normalized.get("recommended_severity"),
         len(normalized.get("relevant_condition_risks") or []),
@@ -944,14 +1656,107 @@ FALLBACK_CONDITION_SYMPTOM_RULES = (
         ),
         "severity_impact": "contact_doctor",
     },
+    {
+        "symptom_re": (
+            r"unresponsive|not\s+responding|can'?t\s+wake|cannot\s+wake|won'?t\s+wake|unable\s+to\s+wake"
+        ),
+        "condition_re": r"diabetes|type\s*1\s*diabetes|type\s*2\s*diabetes",
+        "education": (
+            "With {name}, being unresponsive or difficult to wake may signal severe hypoglycaemia or another "
+            "urgent problem — seek **emergency care (999/112)** now."
+        ),
+        "severity_impact": "emergency",
+    },
+    {
+        "symptom_re": (
+            r"shaky|shaking|sweat|sweaty|sweating\s+a\s+lot|clammy|trembl|hypoglyc|"
+            r"low\s+blood\s+sugar|blood\s+sugar\s+(?:is\s+)?low|sugar\s+(?:is\s+)?low|"
+            r"faint(?:ing|ed)?|passed\s+out"
+        ),
+        "condition_re": r"diabetes|type\s*1\s*diabetes|type\s*2\s*diabetes",
+        "education": (
+            "With {name}, shakiness, sweating, clammy skin, or sudden confusion may be signs of low blood sugar. "
+            "If they can swallow safely, give fast-acting sugar and recheck. Contact the GP urgently; "
+            "call **999/112** if they are unresponsive or cannot wake."
+        ),
+        "severity_impact": "contact_doctor",
+    },
 )
 
 MEDICATION_SYMPTOM_RULES = (
     {
+        "symptom_re": (
+            r"dysphagia|"
+            r"(?:trouble|difficult(?:y)?|problem|hard|can't|cannot|can\s+not)\s+swallow|"
+            r"swallowing\s+(?:is\s+)?(?:hard|difficult|painful)|"
+            r"throat\s+(?:tight|tightness|feel)"
+        ),
+        "med_re": (
+            r"ace inhibitor|lisinopril|ramipril|enalapril|perindopril|captopril|quinapril|"
+            r"fosinopril|trandolapril|benazepril|moexipril"
+        ),
+        "education_stable": (
+            "With {symptom} and {name} (an ACE inhibitor), consider possible **angioedema** — "
+            "a rare but life-threatening reaction. Ask right now about swelling of the lips, tongue, "
+            "face, or throat; difficulty breathing; or voice changes or hoarseness. "
+            "If any of those are present, call **999/112** immediately. "
+            "Even if swallowing alone seems affected, contact the GP **urgently today** — do not wait."
+        ),
+        "education_recent": (
+            "With {symptom} and {name} (an ACE inhibitor — recently started or changed), consider possible "
+            "**angioedema**. Ask right now about swelling of the lips, tongue, face, or throat; "
+            "difficulty breathing; or voice changes or hoarseness. "
+            "If any are present, call **999/112** immediately. "
+            "Contact the GP urgently today even if only swallowing seems difficult."
+        ),
+        "severity_impact": "contact_doctor",
+        "suppress_recent_prefix": True,
+    },
+    {
+        "symptom_re": (
+            r"(?:swollen?|swelling).{0,40}(?:lip|lips|tongue|face|facial|throat|eyelid)|"
+            r"(?:lip|lips|tongue|face|facial|throat|eyelid)\s+swell|"
+            r"facial\s+swelling|\bangioedema\b|"
+            r"(?:can't|cannot|can\s+not|trouble|difficulty|difficult)\s+breath|"
+            r"shortness\s+of\s+breath|trouble\s+breathing|difficulty\s+breathing|"
+            r"stridor|throat\s+(?:tight|tightness|clos)|"
+            r"hoarse(?:ness)?|voice\s+chang|muffled\s+voice"
+        ),
+        "med_re": (
+            r"ace inhibitor|lisinopril|ramipril|enalapril|perindopril|captopril|quinapril|"
+            r"fosinopril|trandolapril|benazepril|moexipril"
+        ),
+        "education": (
+            "With {symptom} and {name} (an ACE inhibitor), this may be **angioedema** — "
+            "seek **emergency care (999/112)** now. Do not wait for symptoms to settle."
+        ),
+        "severity_impact": "emergency",
+        "suppress_recent_prefix": True,
+    },
+    {
+        "symptom_re": (
+            r"(?:\b(?:fall|fell|fallen)\b).{0,150}(?:\bhead\b|bumped\s+(?:her|his|their)?\s*head|"
+            r"hit\s+(?:her|his|their)?\s*head|head\s+injury)|"
+            r"(?:\bhead\b|bumped\s+(?:her|his|their)?\s*head|hit\s+(?:her|his|their)?\s*head|"
+            r"head\s+injury).{0,150}(?:\b(?:fall|fell|fallen)\b)"
+        ),
+        "med_re": (
+            r"warfarin|apixaban|rivaroxaban|edoxaban|dabigatran|heparin|enoxaparin|"
+            r"anticoagul|blood thinner"
+        ),
+        "education": (
+            "With {symptom} and {name} (a blood-thinning medicine), a fall with head impact carries "
+            "risk of internal bleeding — seek **emergency assessment (999/112 or same-day A&E)** now, "
+            "not a routine GP call within 24 hours."
+        ),
+        "severity_impact": "emergency",
+        "suppress_recent_prefix": True,
+    },
+    {
         "symptom_re": r"bruise|bruising|bleed|bleeding|blood|nosebleed|hematoma",
         "med_re": r"warfarin|apixaban|rivaroxaban|edoxaban|dabigatran|heparin|enoxaparin|clopidogrel|aspirin|ticagrelor|prasugrel|anticoagul|blood thinner",
         "education": (
-            "Unusual bruising or bleeding can be linked to blood-thinning medicines like {name}. "
+            "Reported {symptom} can be linked to blood-thinning medicines like {name}. "
             "Contact the GP promptly if bruising is new, widespread, or follows a minor injury."
         ),
         "severity_impact": "contact_doctor",
@@ -960,11 +1765,213 @@ MEDICATION_SYMPTOM_RULES = (
         "symptom_re": r"swell|swollen|swelling|edema|puffiness|fluid",
         "med_re": r"furosemide|bumetanide|torsemide|spironolactone|hydrochlorothiazide|diuretic",
         "education": (
-            "Swelling while taking {name} may mean fluid balance needs review. "
-            "Track ankle swelling, weight, and breathlessness, and contact the GP if swelling worsens."
+            "With {symptom} on file, {name} may mean fluid balance still needs review — or that the diuretic "
+            "dose is not yet controlling fluid. Track ankle or leg swelling, weight, and breathlessness, "
+            "and contact the GP if swelling worsens."
         ),
         "severity_impact": "contact_doctor",
     },
+    {
+        "symptom_re": r"dizz|light.?headed|vertigo|faint",
+        "med_re": r"ace inhibitor|lisinopril|ramipril|enalapril|perindopril|captopril|amlodipine|"
+                  r"beta.?blocker|bisoprolol|metoprolol|furosemide|diuretic|antihypertensive",
+        "education_stable": (
+            "{symptom} can be a side effect of {name}. Check blood pressure if you can, ensure they are "
+            "hydrated, and contact the GP if dizziness is new, severe, or happens when standing up."
+        ),
+        "education_recent": (
+            "{symptom} is a known side effect of {name}, especially after a recent start or dose change. "
+            "Check blood pressure if you can, ensure they are hydrated, and contact the GP if dizziness is "
+            "new, severe, or happens when standing up."
+        ),
+        "severity_impact": "contact_doctor",
+    },
+    {
+        "symptom_re": r"fatigue|tired|letharg|weakness|exhausted",
+        "med_re": r"ace inhibitor|lisinopril|ramipril|enalapril|beta.?blocker|bisoprolol|metoprolol|"
+                  r"furosemide|diuretic|statin|atorvastatin|simvastatin",
+        "education_stable": (
+            "{symptom} can occur with {name}. Monitor for worsening weakness, confusion, or inability to "
+            "carry out usual activities."
+        ),
+        "education_recent": (
+            "{symptom} can occur with {name}, particularly when the medicine was recently started or the dose "
+            "was changed. Monitor for worsening weakness, confusion, or inability to carry out usual activities."
+        ),
+        "severity_impact": "monitor",
+    },
+    {
+        "symptom_re": (
+            r"slow\s+pulse|slow\s+heart(?:beat| ?rate)?|very\s+slow\s+heart|"
+            r"heart\s+rate.{0,40}(?:really\s+)?slow|pulse.{0,40}(?:really\s+)?slow|"
+            r"heart\s+rate\s+(?:is\s+|was\s+|of\s+|around\s+|about\s+|feels?\s+)?(?:4[0-9]|below\s*50|under\s*50|less\s+than\s*50)|"
+            r"pulse\s+(?:is\s+|was\s+|of\s+|around\s+|about\s+|feels?\s+)?(?:4[0-9]|below\s*50|under\s*50|less\s+than\s*50)|"
+            r"(?:maybe|around|about)\s*4[0-9]|"
+            r"pulse\s+below\s*50|heart\s+rate\s+below\s*50|(?:4[0-9])\s*bpm|bradycard"
+        ),
+        "med_re": (
+            r"beta.?blocker|bisoprolol|metoprolol|atenolol|carvedilol|nebivolol|propranolol|"
+            r"sotalol|labetalol"
+        ),
+        "education": (
+            "With {symptom} and {name} (a beta-blocker), a slow heart rate needs urgent review — "
+            "cardiology guidance often says to seek urgent care if the pulse is below 50 bpm. "
+            "Contact the GP today; call **999/112** if they faint or are hard to rouse."
+        ),
+        "severity_impact": "contact_doctor",
+        "suppress_recent_prefix": True,
+    },
+    {
+        "symptom_re": (
+            r"(?:slow|below\s*50|under\s*50|4[0-9]|bradycard).{0,80}(?:faint|passed\s+out|near[- ]?faint|dizz|light.?headed)|"
+            r"(?:faint|passed\s+out|near[- ]?faint|dizz|light.?headed).{0,80}(?:slow|below\s*50|under\s*50|4[0-9]|bradycard)|"
+            r"(?:slow\s+pulse|slow\s+heart|pulse\s+below\s*50|heart\s+rate\s+below\s*50|(?:4[0-9])\s*bpm).{0,80}(?:faint|passed\s+out|near[- ]?faint)"
+        ),
+        "med_re": (
+            r"beta.?blocker|bisoprolol|metoprolol|atenolol|carvedilol|nebivolol|propranolol|"
+            r"sotalol|labetalol"
+        ),
+        "education": (
+            "With {symptom} and {name} (a beta-blocker), slow heart rate with faintness or dizziness is an "
+            "urgent red flag — seek **emergency care (999/112)** now."
+        ),
+        "severity_impact": "emergency",
+        "suppress_recent_prefix": True,
+    },
+    {
+        "symptom_re": (
+            r"unresponsive|not\s+responding|can'?t\s+wake|cannot\s+wake|won'?t\s+wake|unable\s+to\s+wake"
+        ),
+        "med_re": (
+            r"metformin|insulin|glipizide|gliclazide|glimepiride|sitagliptin|empagliflozin|dapagliflozin|"
+            r"saxagliptin|canagliflozin|repaglinide|nateglinide|sulfonylurea"
+        ),
+        "education": (
+            "With {symptom} and {name}, this may be severe hypoglycaemia — seek **emergency care (999/112)** now."
+        ),
+        "severity_impact": "emergency",
+        "suppress_recent_prefix": True,
+    },
+    {
+        "symptom_re": (
+            r"shaky|shaking|sweat|sweaty|sweating\s+a\s+lot|clammy|trembl|hypoglyc|"
+            r"low\s+blood\s+sugar|blood\s+sugar\s+(?:is\s+)?low|sugar\s+(?:is\s+)?low|"
+            r"confus|disorient|faint(?:ing|ed)?|passed\s+out"
+        ),
+        "med_re": (
+            r"metformin|insulin|glipizide|gliclazide|glimepiride|sitagliptin|empagliflozin|dapagliflozin|"
+            r"saxagliptin|canagliflozin|repaglinide|nateglinide|sulfonylurea"
+        ),
+        "education": (
+            "With {symptom} and {name}, this may be low blood sugar. If they can swallow safely, give "
+            "fast-acting sugar and recheck. Contact the GP urgently; call **999/112** if unresponsive."
+        ),
+        "severity_impact": "contact_doctor",
+        "suppress_recent_prefix": True,
+    },
+)
+
+ALLERGY_SYMPTOM_RE = re.compile(
+    r"rash|hives|urticaria|skin reaction|itch|itching|swell|swollen|swelling|"
+    r"breath|breathing|wheez|anaphylaxis|lip swell|tongue swell|throat tight",
+    re.I,
+)
+
+ALLERGY_ANAPHYLAXIS_RE = re.compile(
+    r"anaphyla|"
+    r"(?:can't|cannot|can\s+not)\s+breath|trouble\s+breathing|difficulty\s+breathing|"
+    r"shortness\s+of\s+breath|wheez|stridor|"
+    r"(?:swollen?|swelling)\s+(?:lip|tongue|face|throat)|(?:lip|tongue|face|throat)\s+swell|"
+    r"facial\s+swelling|airway|throat\s+tight|throat\s+clos|"
+    r"passed\s+out|faint(?:ing|ed)?|unconscious|collapse|"
+    r"rapid(?:ly)?\s+spread|spreading\s+(?:quickly|fast|rapid)|whole\s+body\s+(?:rash|hives)",
+    re.I,
+)
+
+ACE_INHIBITOR_MED_RE = (
+    r"ace inhibitor|lisinopril|ramipril|enalapril|perindopril|captopril|quinapril|"
+    r"fosinopril|trandolapril|benazepril|moexipril"
+)
+
+ACE_ANGIOEDEMA_CONCERN_SYMPTOM_RE = re.compile(
+    r"dysphagia|"
+    r"(?:trouble|difficult(?:y)?|problem|hard|can't|cannot|can\s+not)\s+swallow|"
+    r"swallowing\s+(?:is\s+)?(?:hard|difficult|painful)|"
+    r"throat\s+(?:tight|tightness|feel)",
+    re.I,
+)
+
+ACE_ANGIOEDEMA_EMERGENCY_RE = re.compile(
+    r"(?:swollen?|swelling).{0,40}(?:lip|lips|tongue|face|facial|throat|eyelid)|"
+    r"(?:lip|lips|tongue|face|facial|throat|eyelid)\s+swell|"
+    r"facial\s+swelling|\bangioedema\b|"
+    r"(?:can't|cannot|can\s+not|trouble|difficulty|difficult)\s+breath|"
+    r"shortness\s+of\s+breath|trouble\s+breathing|difficulty\s+breathing|"
+    r"stridor|throat\s+(?:tight|tightness|clos)|"
+    r"hoarse(?:ness)?|voice\s+chang|muffled\s+voice|airway",
+    re.I,
+)
+
+CYANOSIS_EMERGENCY_RE = re.compile(
+    r"(?:blue|bluish|purple|gr[ae]y|grey(?:ish)?)\s+lips?|"
+    r"lips?.{0,35}(?:blue|bluish|purple|gr[ae]y|grey(?:ish)?)|"
+    r"blue\s+around\s+(?:the\s+)?mouth|(?:mouth|face|lips?).{0,30}turning\s+blue|"
+    r"\bcyanosis\b|cyanotic",
+    re.I,
+)
+
+BETA_BLOCKER_MED_RE = (
+    r"beta.?blocker|bisoprolol|metoprolol|atenolol|carvedilol|nebivolol|propranolol|"
+    r"sotalol|labetalol"
+)
+
+BRADYCARDIA_CONCERN_RE = re.compile(
+    r"slow\s+pulse|slow\s+heart(?:beat| ?rate)?|very\s+slow\s+heart|"
+    r"heart\s+rate.{0,40}(?:really\s+)?slow|pulse.{0,40}(?:really\s+)?slow|"
+    r"heart\s+rate\s+(?:is\s+|was\s+|of\s+|around\s+|about\s+|feels?\s+)?(?:4[0-9]|below\s*50|under\s*50|less\s+than\s*50)|"
+    r"pulse\s+(?:is\s+|was\s+|of\s+|around\s+|about\s+|feels?\s+)?(?:4[0-9]|below\s*50|under\s*50|less\s+than\s*50)|"
+    r"(?:maybe|around|about)\s*4[0-9]|"
+    r"pulse\s+below\s*50|heart\s+rate\s+below\s*50|(?:4[0-9])\s*bpm|bradycard",
+    re.I,
+)
+
+BRADYCARDIA_EMERGENCY_RE = re.compile(
+    r"(?:slow|below\s*50|under\s*50|4[0-9]|bradycard).{0,80}(?:faint|passed\s+out|near[- ]?faint|dizz|light.?headed)|"
+    r"(?:faint|passed\s+out|near[- ]?faint|dizz|light.?headed).{0,80}(?:slow|below\s*50|under\s*50|4[0-9]|bradycard)|"
+    r"(?:slow\s+pulse|slow\s+heart|pulse\s+below\s*50|heart\s+rate\s+below\s*50|(?:4[0-9])\s*bpm).{0,80}(?:faint|passed\s+out|near[- ]?faint)",
+    re.I,
+)
+
+DIABETES_CONDITION_RE = re.compile(r"diabetes|type\s*1\s*diabetes|type\s*2\s*diabetes", re.I)
+
+DIABETES_MED_RE = (
+    r"metformin|insulin|glipizide|gliclazide|glimepiride|sitagliptin|empagliflozin|dapagliflozin|"
+    r"saxagliptin|canagliflozin|repaglinide|nateglinide|sulfonylurea"
+)
+
+HYPOGLYCEMIA_EMERGENCY_RE = re.compile(
+    r"unresponsive|not\s+responding|can'?t\s+wake|cannot\s+wake|won'?t\s+wake|unable\s+to\s+wake",
+    re.I,
+)
+
+HYPOGLYCEMIA_CONCERN_RE = re.compile(
+    r"confus|disorient|shaky|shaking|sweat|sweaty|sweating\s+a\s+lot|clammy|trembl|"
+    r"hypoglyc|low\s+blood\s+sugar|blood\s+sugar\s+(?:is\s+)?low|sugar\s+(?:is\s+)?low|"
+    r"faint(?:ing|ed)?|passed\s+out",
+    re.I,
+)
+
+ANTICOAGULANT_MED_RE = (
+    r"warfarin|apixaban|rivaroxaban|edoxaban|dabigatran|heparin|enoxaparin|"
+    r"anticoagul|blood thinner"
+)
+
+ANTICOAGULANT_HEAD_TRAUMA_RE = re.compile(
+    r"(?:\b(?:fall|fell|fallen)\b).{0,150}(?:\bhead\b|bumped\s+(?:her|his|their)?\s*head|"
+    r"hit\s+(?:her|his|their)?\s*head|head\s+injury)|"
+    r"(?:\bhead\b|bumped\s+(?:her|his|their)?\s*head|hit\s+(?:her|his|their)?\s*head|"
+    r"head\s+injury).{0,150}(?:\b(?:fall|fell|fallen)\b)",
+    re.I,
 )
 
 
@@ -1031,7 +2038,44 @@ def apply_condition_relevance_fallback(
     return normalize_symptom_condition_analysis(payload)
 
 
-def build_medication_symptom_alerts(symptom_text: str, medications: list | None) -> list[dict]:
+def _build_medication_education_message(
+    med_name: str,
+    symptom_text: str,
+    body_template: str,
+    *,
+    is_recent: bool = False,
+    active_patient_name: str = "",
+    suppress_recent_prefix: bool = False,
+) -> str:
+    symptom_label = summarize_reported_symptom(symptom_text, active_patient_name)
+    body = body_template.format(name=med_name, symptom=symptom_label)
+    if is_recent and not suppress_recent_prefix:
+        body = (
+            f"{med_name} was recently started or changed — a common time to notice new side effects. "
+            f"{body}"
+        )
+    return ensure_condition_education_format(med_name, body)
+
+
+def _medication_name_matches_pattern(med_name: str, med_blob: str, pattern: str) -> bool:
+    combined = f"{med_name} {med_blob}"
+    return bool(re.search(pattern, combined, re.I))
+
+
+def _medication_rule_education_template(rule: dict, *, is_recent: bool) -> str:
+    if is_recent and rule.get("education_recent"):
+        return str(rule["education_recent"])
+    if rule.get("education_stable"):
+        return str(rule["education_stable"])
+    return str(rule.get("education") or "")
+
+
+def build_medication_symptom_alerts(
+    symptom_text: str,
+    medications: list | None,
+    *,
+    active_patient_name: str = "",
+) -> list[dict]:
     """Rule-based links between reported symptoms and current medications."""
     symptom_lower = str(symptom_text or "").lower()
     if not symptom_lower or not medications:
@@ -1043,27 +2087,596 @@ def build_medication_symptom_alerts(symptom_text: str, medications: list | None)
         med_name = str(med.get("name") or med.get("medication_name") or "").strip()
         if not med_name:
             continue
-        med_blob = " ".join(
-            str(med.get(key) or "")
-            for key in ("name", "medication_name", "dosage", "dosage_instructions", "timing", "schedule")
-        )
+        med_blob = medication_symptom_context_blob(med)
+        is_recent = medication_has_explicit_recent_start(med)
+        matched_rule = None
         for rule in MEDICATION_SYMPTOM_RULES:
             if not re.search(rule["symptom_re"], symptom_lower, re.I):
                 continue
-            if not re.search(rule["med_re"], med_blob, re.I):
+            if not _medication_name_matches_pattern(med_name, med_blob, rule["med_re"]):
                 continue
-            key = med_name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            alerts.append({
-                "condition_name": med_name,
-                "is_relevant": True,
-                "severity_impact": rule["severity_impact"],
-                "education_message": f"How {med_name} Relates to This Symptom: {rule['education'].format(name=med_name)}",
-            })
+            matched_rule = dict(rule)
+            matched_rule["education"] = _medication_rule_education_template(rule, is_recent=is_recent)
             break
+        if not matched_rule:
+            for symptom_re, med_re, hint in MEDICATION_SIDE_EFFECT_HINTS:
+                if not re.search(symptom_re, symptom_lower, re.I):
+                    continue
+                if not _medication_name_matches_pattern(med_name, med_blob, med_re):
+                    continue
+                if not is_recent:
+                    continue
+                matched_rule = {
+                    "education": (
+                        f"{hint} With {{symptom}} reported now, mention this to the GP."
+                    ),
+                    "severity_impact": "contact_doctor",
+                }
+                break
+        if not matched_rule:
+            if is_recent:
+                matched_rule = {
+                    "education": (
+                        "You reported {symptom} and {name} was recently started or changed. "
+                        "New medicines commonly cause side effects in the first days or weeks — "
+                        "note when symptoms began relative to the medicine and contact the GP if concerned."
+                    ),
+                    "severity_impact": "monitor",
+                }
+            else:
+                continue
+        key = med_name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        alerts.append({
+            "condition_name": med_name,
+            "is_relevant": True,
+            "severity_impact": matched_rule["severity_impact"],
+            "education_message": _build_medication_education_message(
+                med_name,
+                symptom_text,
+                matched_rule["education"],
+                is_recent=is_recent,
+                active_patient_name=active_patient_name,
+                suppress_recent_prefix=bool(matched_rule.get("suppress_recent_prefix")),
+            ),
+        })
     return alerts
+
+
+def patient_takes_ace_inhibitor(medications: list | None) -> bool:
+    for med in medications or []:
+        med_name = str(med.get("name") or med.get("medication_name") or "").strip()
+        if not med_name:
+            continue
+        med_blob = medication_symptom_context_blob(med)
+        if _medication_name_matches_pattern(med_name, med_blob, ACE_INHIBITOR_MED_RE):
+            return True
+    return False
+
+
+def reported_symptom_suggests_ace_angioedema_concern(symptom_text: str) -> bool:
+    return bool(ACE_ANGIOEDEMA_CONCERN_SYMPTOM_RE.search(str(symptom_text or "")))
+
+
+def reported_symptom_has_ace_angioedema_red_flags(symptom_text: str) -> bool:
+    return bool(ACE_ANGIOEDEMA_EMERGENCY_RE.search(str(symptom_text or "")))
+
+
+def classify_ace_angioedema_severity(symptom_text: str) -> str | None:
+    """Minimum severity when an ACE inhibitor patient reports angioedema-type symptoms."""
+    text = str(symptom_text or "")
+    if reported_symptom_has_ace_angioedema_red_flags(text):
+        return "emergency"
+    if reported_symptom_suggests_ace_angioedema_concern(text):
+        return "contact_doctor"
+    return None
+
+
+def cap_ace_angioedema_report_severity(
+    symptom_text: str,
+    severity: str,
+    medications: list | None,
+) -> str:
+    if not patient_takes_ace_inhibitor(medications):
+        return severity
+    floor = classify_ace_angioedema_severity(symptom_text)
+    if floor:
+        return escalate_severity(severity, floor)
+    return severity
+
+
+def reported_symptom_has_cyanosis(symptom_text: str) -> bool:
+    return bool(CYANOSIS_EMERGENCY_RE.search(str(symptom_text or "")))
+
+
+def classify_cyanosis_severity(symptom_text: str) -> str | None:
+    if reported_symptom_has_cyanosis(symptom_text):
+        return "emergency"
+    return None
+
+
+def cap_cyanosis_report_severity(symptom_text: str, severity: str) -> str:
+    floor = classify_cyanosis_severity(symptom_text)
+    if floor:
+        return escalate_severity(severity, floor)
+    return severity
+
+
+def patient_takes_beta_blocker(medications: list | None) -> bool:
+    for med in medications or []:
+        med_name = str(med.get("name") or med.get("medication_name") or "").strip()
+        if not med_name:
+            continue
+        med_blob = medication_symptom_context_blob(med)
+        if _medication_name_matches_pattern(med_name, med_blob, BETA_BLOCKER_MED_RE):
+            return True
+    return False
+
+
+def classify_beta_blocker_bradycardia_severity(symptom_text: str) -> str | None:
+    text = str(symptom_text or "")
+    if BRADYCARDIA_EMERGENCY_RE.search(text):
+        return "emergency"
+    if BRADYCARDIA_CONCERN_RE.search(text):
+        return "contact_doctor"
+    return None
+
+
+def cap_beta_blocker_bradycardia_report_severity(
+    symptom_text: str,
+    severity: str,
+    medications: list | None,
+) -> str:
+    if not patient_takes_beta_blocker(medications):
+        return severity
+    floor = classify_beta_blocker_bradycardia_severity(symptom_text)
+    if floor:
+        return escalate_severity(severity, floor)
+    return severity
+
+
+def patient_has_diabetes_context(
+    conditions: list | None,
+    medications: list | None = None,
+) -> bool:
+    for condition in conditions or []:
+        if DIABETES_CONDITION_RE.search(str(condition.get("name") or "")):
+            return True
+    for med in medications or []:
+        med_name = str(med.get("name") or med.get("medication_name") or "").strip()
+        if not med_name:
+            continue
+        med_blob = medication_symptom_context_blob(med)
+        if _medication_name_matches_pattern(med_name, med_blob, DIABETES_MED_RE):
+            return True
+    return False
+
+
+def classify_hypoglycemia_severity(symptom_text: str) -> str | None:
+    text = str(symptom_text or "")
+    if HYPOGLYCEMIA_EMERGENCY_RE.search(text):
+        return "emergency"
+    if HYPOGLYCEMIA_CONCERN_RE.search(text):
+        return "contact_doctor"
+    return None
+
+
+def cap_hypoglycemia_report_severity(
+    symptom_text: str,
+    severity: str,
+    conditions: list | None,
+    medications: list | None = None,
+) -> str:
+    if not patient_has_diabetes_context(conditions, medications):
+        return severity
+    floor = classify_hypoglycemia_severity(symptom_text)
+    if floor:
+        return escalate_severity(severity, floor)
+    return severity
+
+
+def patient_takes_anticoagulant(medications: list | None) -> bool:
+    for med in medications or []:
+        med_name = str(med.get("name") or med.get("medication_name") or "").strip()
+        if not med_name:
+            continue
+        med_blob = medication_symptom_context_blob(med)
+        if _medication_name_matches_pattern(med_name, med_blob, ANTICOAGULANT_MED_RE):
+            return True
+    return False
+
+
+def reported_symptom_suggests_anticoagulant_head_trauma(symptom_text: str) -> bool:
+    return bool(ANTICOAGULANT_HEAD_TRAUMA_RE.search(str(symptom_text or "")))
+
+
+def classify_anticoagulant_head_trauma_severity(symptom_text: str) -> str | None:
+    if reported_symptom_suggests_anticoagulant_head_trauma(symptom_text):
+        return "emergency"
+    return None
+
+
+def cap_anticoagulant_head_trauma_report_severity(
+    symptom_text: str,
+    severity: str,
+    medications: list | None,
+) -> str:
+    if not patient_takes_anticoagulant(medications):
+        return severity
+    floor = classify_anticoagulant_head_trauma_severity(symptom_text)
+    if floor:
+        return escalate_severity(severity, floor)
+    return severity
+
+
+def apply_report_severity_floor_caps(
+    symptom_text: str,
+    severity: str,
+    *,
+    medications: list | None = None,
+    conditions: list | None = None,
+) -> str:
+    """Apply all structural severity floors (up-only) after AI/session resolution."""
+    severity = cap_cyanosis_report_severity(symptom_text, severity)
+    severity = cap_ace_angioedema_report_severity(symptom_text, severity, medications)
+    severity = cap_beta_blocker_bradycardia_report_severity(symptom_text, severity, medications)
+    severity = cap_hypoglycemia_report_severity(symptom_text, severity, conditions, medications)
+    severity = cap_anticoagulant_head_trauma_report_severity(symptom_text, severity, medications)
+    return severity
+
+
+def _apply_structural_severity_floor_policy(
+    symptom_text: str,
+    analysis: dict,
+    *,
+    floor: str | None,
+) -> dict:
+    if not floor:
+        return analysis
+    payload = dict(analysis)
+    payload["recommended_severity"] = escalate_severity(
+        payload.get("recommended_severity") or "monitor",
+        floor,
+    )
+    payload["needs_doctor"] = payload["recommended_severity"] in ("contact_doctor", "emergency")
+    payload["is_elevated_risk"] = True
+    normalized = normalize_symptom_condition_analysis(payload)
+    if analysis.get("allergy_symptom_alerts") is not None:
+        normalized["allergy_symptom_alerts"] = analysis.get("allergy_symptom_alerts")
+    if analysis.get("medication_symptom_alerts") is not None:
+        normalized["medication_symptom_alerts"] = analysis.get("medication_symptom_alerts")
+    return normalized
+
+
+def apply_cyanosis_severity_policy(symptom_text: str, analysis: dict) -> dict:
+    return _apply_structural_severity_floor_policy(
+        symptom_text,
+        analysis,
+        floor=classify_cyanosis_severity(symptom_text),
+    )
+
+
+def apply_beta_blocker_bradycardia_severity_policy(
+    symptom_text: str,
+    analysis: dict,
+    medications: list | None = None,
+) -> dict:
+    if not patient_takes_beta_blocker(medications):
+        return analysis
+    return _apply_structural_severity_floor_policy(
+        symptom_text,
+        analysis,
+        floor=classify_beta_blocker_bradycardia_severity(symptom_text),
+    )
+
+
+def apply_hypoglycemia_severity_policy(
+    symptom_text: str,
+    analysis: dict,
+    conditions: list | None = None,
+    medications: list | None = None,
+) -> dict:
+    if not patient_has_diabetes_context(conditions, medications):
+        return analysis
+    return _apply_structural_severity_floor_policy(
+        symptom_text,
+        analysis,
+        floor=classify_hypoglycemia_severity(symptom_text),
+    )
+
+
+def apply_anticoagulant_head_trauma_severity_policy(
+    symptom_text: str,
+    analysis: dict,
+    medications: list | None = None,
+) -> dict:
+    if not patient_takes_anticoagulant(medications):
+        return analysis
+    return _apply_structural_severity_floor_policy(
+        symptom_text,
+        analysis,
+        floor=classify_anticoagulant_head_trauma_severity(symptom_text),
+    )
+
+
+def apply_ace_angioedema_severity_policy(
+    symptom_text: str,
+    analysis: dict,
+    medications: list | None = None,
+) -> dict:
+    if not patient_takes_ace_inhibitor(medications):
+        return analysis
+    floor = classify_ace_angioedema_severity(symptom_text)
+    if not floor:
+        return analysis
+
+    payload = dict(analysis)
+    payload["recommended_severity"] = escalate_severity(
+        payload.get("recommended_severity") or "monitor",
+        floor,
+    )
+    payload["needs_doctor"] = payload["recommended_severity"] in ("contact_doctor", "emergency")
+    payload["is_elevated_risk"] = True
+    normalized = normalize_symptom_condition_analysis(payload)
+    if analysis.get("allergy_symptom_alerts") is not None:
+        normalized["allergy_symptom_alerts"] = analysis.get("allergy_symptom_alerts")
+    if analysis.get("medication_symptom_alerts") is not None:
+        normalized["medication_symptom_alerts"] = analysis.get("medication_symptom_alerts")
+    return normalized
+
+
+def reported_symptom_has_anaphylaxis_red_flags(symptom_text: str) -> bool:
+    return bool(ALLERGY_ANAPHYLAXIS_RE.search(str(symptom_text or "")))
+
+
+def classify_allergic_reaction_severity(symptom_text: str) -> str:
+    if reported_symptom_has_anaphylaxis_red_flags(symptom_text):
+        return "emergency"
+    if symptom_suggests_allergic_reaction(symptom_text):
+        return "contact_doctor"
+    return "monitor"
+
+
+def cap_allergy_report_severity(symptom_text: str, severity: str) -> str:
+    """Prevent allergy-on-file alone from forcing EMERGENCY when the report lacks red flags."""
+    level = normalize_severity_level(severity)
+    if reported_symptom_has_anaphylaxis_red_flags(symptom_text):
+        return level
+    if symptom_suggests_allergic_reaction(symptom_text) and level == "emergency":
+        return "contact_doctor"
+    return level
+
+
+_POSITIVE_BENIGN_REPORT_RE = re.compile(
+    r"\b("
+    r"good appetite|appetite (?:is |was )?good|ate well|eating well|"
+    r"slept well|sleeping well|sleep (?:was |is )?good|"
+    r"went for a walk|took a walk|walked (?:in|around|to|for)|"
+    r"feeling (?:much )?better|feeling fine|feeling well|"
+    r"no complaints|no issues|no problems|doing well|doing fine|"
+    r"good day|great day|positive update|all good"
+    r")\b",
+    re.I,
+)
+
+_NEGATIVE_SYMPTOM_LANGUAGE_RE = re.compile(
+    r"\b("
+    r"pain|ache|aches|hurt|hurting|sore|swell|swollen|swelling|"
+    r"fever|temp(?:erature)?|confus|breath|wheez|wheezing|cough|coughing|"
+    r"nausea|vomit|vomiting|rash|hives|urticaria|bleed|bleeding|bruise|"
+    r"\bfell\b|\bfall\b|\bfallen\b|dizz|weak|weakness|limp|"
+    r"worse|worsening|deteriorat|not (?:eating|sleeping|improving|better)|"
+    r"poor appetite|no appetite|lost appetite|can'?t eat|refused (?:to eat|food)|"
+    r"chest pain|headache|shortness of breath|palpitat|emergency|urgent"
+    r")\b",
+    re.I,
+)
+
+
+def is_clearly_positive_benign_report(text: str) -> bool:
+    """True when the caregiver message is good news with no negative symptom language."""
+    cleaned = str(text or "").strip()
+    if not cleaned or cleaned.endswith("?"):
+        return False
+    if not _POSITIVE_BENIGN_REPORT_RE.search(cleaned):
+        return False
+    return not _NEGATIVE_SYMPTOM_LANGUAGE_RE.search(cleaned)
+
+
+def cap_positive_report_severity(symptom_text: str, severity: str) -> str:
+    """Keep clearly positive updates at OK — stale session data must not escalate them."""
+    if not is_clearly_positive_benign_report(symptom_text):
+        return normalize_severity_level(severity)
+    level = normalize_severity_level(severity)
+    if level in ("emergency", "contact_doctor", "monitor"):
+        return "ok"
+    return level
+
+
+def is_care_question_text(text: str) -> bool:
+    cleaned = str(text or "").strip().lower()
+    if not cleaned:
+        return False
+    if cleaned.endswith("?"):
+        return True
+    question_starts = (
+        "what ", "when ", "where ", "who ", "why ", "how ",
+        "is ", "are ", "can ", "should ", "does ", "do ", "could ",
+    )
+    return cleaned.startswith(question_starts)
+
+
+def reports_health_symptom_topic(text: str) -> bool:
+    """True when a message describes a symptom or health change worth cross-checking."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False
+    if is_clearly_positive_benign_report(cleaned):
+        return False
+    if not is_care_question_text(cleaned):
+        return True
+    return bool(
+        re.search(
+            r"stiff|stiffness|pain|ache|swell|swollen|fever|temperature|confus|bruise|bleed|"
+            r"breath|cough|nausea|vomit|rash|hives|urticaria|wound|fall|dizzy|weak|tired|fatigue|limp|"
+            r"mobility|walking|knee|hip|joint|headache|chest|palpitat",
+            cleaned,
+            re.I,
+        )
+    )
+
+
+_QUESTION_SYMPTOM_CONCERN_RE = re.compile(
+    r"\b(?:"
+    r"not\b.{0,40}\bworking\b|isn'?t\b.{0,40}\bworking\b|stopped\s+working|doesn'?t\s+seem\s+to\s+(?:be\s+)?working|"
+    r"not\s+helping|isn'?t\s+helping|stopped\s+helping|"
+    r"side\s+effect|adverse\s+reaction|allergic\s+reaction|"
+    r"worried|worry|concern(?:ed)?|"
+    r"worse|worsening|getting\s+worse|deteriorat|not\s+improving|"
+    r"problem|issue|trouble|unusual|strange|"
+    r"causing\s+(?:his|her|their|the\s+)?|"
+    r"making\s+(?:him|her|them)\s+"
+    r")\b",
+    re.I,
+)
+
+
+def is_pure_informational_care_question(text: str) -> bool:
+    """True for medication/care questions with no reported symptom or expressed concern."""
+    cleaned = str(text or "").strip()
+    if not cleaned or not is_care_question_text(cleaned):
+        return False
+    if reports_health_symptom_topic(cleaned):
+        return False
+    if _QUESTION_SYMPTOM_CONCERN_RE.search(cleaned):
+        return False
+    if re.search(r"\bhow(?:'s| is| are| was| were)\b.+\bworking\b", cleaned, re.I):
+        return True
+    return True
+
+
+def cap_informational_question_severity(user_text: str, severity: str) -> str:
+    """Routine care questions should not inherit urgency from AI reply or session context."""
+    if not is_pure_informational_care_question(user_text):
+        return normalize_severity_level(severity)
+    level = normalize_severity_level(severity)
+    if level in ("emergency", "contact_doctor", "monitor"):
+        return "ok"
+    return level
+
+
+def _is_allergy_related_risk(condition_name: str, allergies: list | None) -> bool:
+    name = str(condition_name or "").strip().lower()
+    if not name:
+        return False
+    for allergy in allergies or []:
+        allergy_clean = re.sub(
+            r"^(allerg(?:y|ies)|adverse reaction(?:s)?)\s*(?:to|:)?\s*",
+            "",
+            str(allergy or ""),
+            flags=re.I,
+        ).strip().lower()
+        if allergy_clean and (name in allergy_clean or allergy_clean in name):
+            return True
+    return False
+
+
+def apply_allergy_severity_policy(
+    symptom_text: str,
+    analysis: dict,
+    allergies: list | None = None,
+) -> dict:
+    """Align cross-check severity with reported symptom red flags, not allergy records alone."""
+    if not symptom_suggests_allergic_reaction(symptom_text):
+        return analysis
+    if reported_symptom_has_anaphylaxis_red_flags(symptom_text):
+        return analysis
+
+    payload = dict(analysis)
+    risks = []
+    for item in payload.get("condition_risks") or []:
+        row = dict(item)
+        impact = normalize_severity_level(row.get("severity_impact") or "none")
+        if impact == "emergency" and _is_allergy_related_risk(row.get("condition_name"), allergies):
+            row["severity_impact"] = "contact_doctor"
+        risks.append(row)
+    payload["condition_risks"] = risks
+
+    recommended = cap_allergy_report_severity(symptom_text, payload.get("recommended_severity") or "monitor")
+    payload["recommended_severity"] = recommended
+    payload["needs_doctor"] = recommended in ("contact_doctor", "emergency")
+    normalized = normalize_symptom_condition_analysis(payload)
+    if analysis.get("allergy_symptom_alerts") is not None:
+        normalized["allergy_symptom_alerts"] = analysis.get("allergy_symptom_alerts")
+    if analysis.get("medication_symptom_alerts") is not None:
+        normalized["medication_symptom_alerts"] = analysis.get("medication_symptom_alerts")
+    return normalized
+
+
+def build_allergy_symptom_alerts(
+    symptom_text: str,
+    allergies: list | None,
+    *,
+    active_patient_name: str = "",
+) -> list[dict]:
+    symptom_lower = str(symptom_text or "").lower()
+    if not symptom_lower or not allergies:
+        return []
+    if not ALLERGY_SYMPTOM_RE.search(symptom_lower):
+        return []
+
+    alerts = []
+    symptom_label = summarize_reported_symptom(symptom_text, active_patient_name)
+    severity_impact = classify_allergic_reaction_severity(symptom_text)
+    for allergy in allergies:
+        label = str(allergy or "").strip()
+        if not label:
+            continue
+        name = re.sub(r"^(allerg(?:y|ies)|adverse reaction(?:s)?)\s*(?:to|:)?\s*", "", label, flags=re.I).strip()
+        if not name:
+            name = label
+        body = (
+            f"You reported {symptom_label}. {name} is documented as an allergy or adverse reaction for this patient. "
+            "Consider whether any new medicine, food, or substance was introduced recently. "
+        )
+        if severity_impact == "emergency":
+            body += "The symptoms described need urgent assessment — seek emergency care now."
+        else:
+            body += (
+                "Contact the GP promptly. Seek emergency care if breathing difficulty, facial or throat swelling, "
+                "or a rapidly spreading rash develops."
+            )
+        alerts.append({
+            "condition_name": name,
+            "is_relevant": True,
+            "severity_impact": severity_impact,
+            "education_message": ensure_condition_education_format(name, body),
+        })
+    return alerts
+
+
+def retailor_education_messages_to_symptom(
+    symptom_text: str,
+    risks: list,
+    active_patient_name: str = "",
+) -> list:
+    symptom_label = summarize_reported_symptom(symptom_text, active_patient_name)
+    tailored = []
+    for item in risks or []:
+        row = dict(item)
+        message = str(row.get("education_message") or "").strip()
+        if not message:
+            tailored.append(row)
+            continue
+        prefix_match = re.match(r"^(How .+? Impacts This Symptom:\s*)", message, re.I)
+        if prefix_match and symptom_label.lower() not in message.lower():
+            row["education_message"] = prefix_match.group(1) + (
+                f"For {symptom_label}: " + message[len(prefix_match.group(1)) :]
+            )
+        tailored.append(row)
+    return tailored
 
 
 def enrich_symptom_condition_analysis(
@@ -1071,11 +2684,21 @@ def enrich_symptom_condition_analysis(
     analysis: dict,
     conditions: list,
     medications: list | None = None,
+    allergies: list | None = None,
+    *,
+    active_patient_name: str = "",
 ) -> dict:
     enriched = apply_condition_relevance_fallback(symptom_text, analysis, conditions)
-    med_alerts = build_medication_symptom_alerts(symptom_text, medications)
-    if not med_alerts:
-        return enriched
+    med_alerts = build_medication_symptom_alerts(
+        symptom_text,
+        medications,
+        active_patient_name=active_patient_name,
+    )
+    allergy_alerts = build_allergy_symptom_alerts(
+        symptom_text,
+        allergies,
+        active_patient_name=active_patient_name,
+    )
 
     merged_risks = [dict(item) for item in (enriched.get("condition_risks") or [])]
     existing_names = {
@@ -1083,17 +2706,216 @@ def enrich_symptom_condition_analysis(
         for item in merged_risks
         if item.get("is_relevant")
     }
-    for alert in med_alerts:
+    for alert in med_alerts + allergy_alerts:
         key = str(alert.get("condition_name") or "").strip().lower()
         if key in existing_names:
+            for index, item in enumerate(merged_risks):
+                if str(item.get("condition_name") or "").strip().lower() == key and item.get("is_relevant"):
+                    merged_risks[index] = alert
+                    break
             continue
         merged_risks.append(alert)
+        existing_names.add(key)
+
+    merged_risks = retailor_education_messages_to_symptom(
+        symptom_text,
+        merged_risks,
+        active_patient_name,
+    )
 
     payload = dict(enriched)
     payload["condition_risks"] = merged_risks
     normalized = normalize_symptom_condition_analysis(payload)
-    normalized["medication_symptom_alerts"] = med_alerts
+    if med_alerts:
+        normalized["medication_symptom_alerts"] = med_alerts
+    if allergy_alerts:
+        normalized["allergy_symptom_alerts"] = allergy_alerts
+    normalized = apply_allergy_severity_policy(symptom_text, normalized, allergies)
+    normalized = apply_cyanosis_severity_policy(symptom_text, normalized)
+    normalized = apply_ace_angioedema_severity_policy(symptom_text, normalized, medications)
+    normalized = apply_beta_blocker_bradycardia_severity_policy(symptom_text, normalized, medications)
+    normalized = apply_hypoglycemia_severity_policy(
+        symptom_text,
+        normalized,
+        conditions,
+        medications,
+    )
+    normalized = apply_anticoagulant_head_trauma_severity_policy(
+        symptom_text,
+        normalized,
+        medications,
+    )
+    current_label = summarize_reported_symptom(symptom_text, active_patient_name)
+    if current_label and current_label != "this symptom":
+        normalized["symptom_identified"] = _brief_symptom_label(current_label, active_patient_name)
     return normalized
+
+
+def _brief_symptom_label(symptom_label: str, active_patient_name: str = "") -> str:
+    label = str(symptom_label or "").strip()
+    tokens = _patient_name_tokens(active_patient_name)
+    if tokens:
+        first = tokens[0]
+        prefix = f"{first}'s "
+        if label.lower().startswith(prefix.lower()):
+            return label[len(prefix):].strip() or label
+    return label
+
+
+_CLAIMED_PROCEDURE_TOPIC_RE = re.compile(
+    r"\b(?:"
+    r"(?:knee|hip|shoulder|spine|back|cardiac|heart|abdominal|hernia|cataract|hip|ankle|wrist|elbow)\s+"
+    r"(?:surgery|operation|procedure|replacement)"
+    r"|(?:surgery|operation|procedure)\s+(?:on|for|to)\s+(?:his|her|their|the\s+)?"
+    r"(?:knee|hip|shoulder|spine|back|heart|abdominal|hernia|cataract|ankle|wrist|elbow)"
+    r"|post[- ]?op(?:erative)?\s+"
+    r"(?:knee|hip|shoulder|spine|back|heart|abdominal|hernia|cataract|ankle|wrist|elbow)"
+    r")\b",
+    re.I,
+)
+
+_CLAIMED_DIAGNOSIS_TOPIC_RE = re.compile(
+    r"\b(?:his|her|their|the\s+patient(?:'s)?\s+)?"
+    r"((?:type\s+[12]\s+)?diabetes(?:\s+mellitus)?|heart failure|atrial fibrillation|"
+    r"osteoarthritis|dementia|alzheimer(?:'s)?|copd|asthma|stroke|cancer|"
+    r"hypertension|kidney disease|ckd|liver disease|cirrhosis)\b",
+    re.I,
+)
+
+_SURGERY_WORD_RE = re.compile(r"\b(?:surgery|surgical|operation|operated|post[- ]?op)\b", re.I)
+
+
+def collect_patient_record_text_corpus(patient_id=None) -> str:
+    patient_id = resolve_patient_id(patient_id)
+    parts: list[str] = []
+    for condition in get_patient_conditions(patient_id):
+        parts.append(str(condition.get("name") or ""))
+        parts.append(str(condition.get("badge") or ""))
+        since = normalize_condition_since(condition.get("since"))
+        if since:
+            parts.append(since)
+    for allergy in get_patient_allergy_notes(patient_id):
+        parts.append(str(allergy or ""))
+    for med in get_patient_medications_for_symptom_context(patient_id):
+        parts.append(str(med.get("name") or ""))
+        parts.append(str(med.get("dosage_instructions") or ""))
+        parts.append(str(med.get("notes") or ""))
+    for doc in fetch_recent_document_excerpts(patient_id, max_docs=8, max_chars=1200):
+        parts.append(str(doc.get("file_name") or ""))
+        parts.append(str(doc.get("excerpt") or ""))
+    for report in fetch_patient_care_reports(patient_id, limit=100):
+        parts.append(str(report.get("summary") or ""))
+        parts.append(str(report.get("text") or ""))
+        parts.append(str(report.get("doctor_note") or ""))
+    return "\n".join(part for part in parts if part).lower()
+
+
+def _normalize_claim_topic(topic: str) -> str:
+    return re.sub(r"\s+", " ", str(topic or "").strip(" .,;")).lower()
+
+
+def _topic_supported_in_patient_record(topic: str, corpus: str) -> bool:
+    normalized = _normalize_claim_topic(topic)
+    if not normalized or not corpus:
+        return False
+    if normalized in corpus:
+        return True
+    words = [word for word in normalized.split() if len(word) > 2]
+    if len(words) >= 2 and all(word in corpus for word in words):
+        return True
+    if _SURGERY_WORD_RE.search(normalized):
+        body_part_match = re.search(
+            r"\b(knee|hip|shoulder|spine|back|heart|cardiac|abdominal|hernia|cataract|ankle|wrist|elbow)\b",
+            normalized,
+            re.I,
+        )
+        if body_part_match:
+            part = body_part_match.group(1).lower()
+            if part in corpus and _SURGERY_WORD_RE.search(corpus):
+                return True
+        return False
+    return normalized in corpus
+
+
+def extract_unverified_patient_claims(question: str, patient_id=None) -> list[str]:
+    """Caregiver-asserted procedures/diagnoses not found in stored patient data."""
+    text = str(question or "").strip()
+    if not text:
+        return []
+    corpus = collect_patient_record_text_corpus(patient_id)
+    claims: list[str] = []
+    seen: set[str] = set()
+
+    def _add(topic: str) -> None:
+        clean = _normalize_claim_topic(topic)
+        if not clean or clean in seen:
+            return
+        seen.add(clean)
+        if not _topic_supported_in_patient_record(clean, corpus):
+            claims.append(clean)
+
+    for match in _CLAIMED_PROCEDURE_TOPIC_RE.finditer(text):
+        _add(match.group(0))
+    for match in _CLAIMED_DIAGNOSIS_TOPIC_RE.finditer(text):
+        _add(match.group(1))
+
+    return claims
+
+
+def build_patient_claim_grounding_prompt_block(question: str, patient_id=None) -> str:
+    unverified = extract_unverified_patient_claims(question, patient_id)
+    if not unverified:
+        return ""
+    patient_name = get_patient_display_name(patient_id)
+    topics = "; ".join(unverified)
+    return (
+        "PATIENT RECORD GROUNDING — mandatory for this question:\n"
+        f"- The caregiver referenced: {topics}\n"
+        f"- CareShield has NO record of this in {patient_name}'s stored conditions, medications, "
+        "allergies, uploaded documents, or care timeline.\n"
+        "- You MUST say clearly that nothing about this is on file for this patient.\n"
+        "- Do NOT answer as if the surgery, procedure, or diagnosis is confirmed for this patient.\n"
+        "- You may offer brief general education only after stating it is not documented, and invite "
+        "the caregiver to upload records or add the condition if it applies."
+    )
+
+
+def enforce_patient_record_grounding_in_reply(
+    reply: str,
+    question: str,
+    patient_id=None,
+) -> str:
+    unverified = extract_unverified_patient_claims(question, patient_id)
+    if not unverified:
+        return str(reply or "").strip()
+    patient_name = get_patient_display_name(patient_id)
+    text = str(reply or "").strip()
+    lowered = text.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "no record",
+            "not on file",
+            "nothing on file",
+            "isn't on file",
+            "is not on file",
+            "not documented",
+            "no documentation",
+            "don't have any record",
+            "do not have any record",
+        )
+    ):
+        return text
+    if len(unverified) == 1:
+        topic_phrase = unverified[0]
+    else:
+        topic_phrase = ", ".join(unverified[:-1]) + f", and {unverified[-1]}"
+    prefix = (
+        f"I don't have any record of {topic_phrase} in {patient_name}'s stored profile "
+        f"(conditions, medications, uploaded documents, or care timeline). "
+        f"I'll share general guidance only — please upload records or add it to the profile if it applies.\n\n"
+    )
+    return prefix + text
 
 
 def extract_allergy_mentions_from_text(raw_text: str, limit: int = 8) -> list[str]:
@@ -1102,21 +2924,84 @@ def extract_allergy_mentions_from_text(raw_text: str, limit: int = 8) -> list[st
         return []
     found = []
     seen = set()
+
+    def _add(label: str) -> None:
+        clean = re.sub(r"\s+", " ", str(label or "")).strip(" .,;")
+        if not clean:
+            return
+        key = clean.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(clean)
+
+    def _expand_capture(capture: str) -> None:
+        capture = str(capture or "").strip(" .,;")
+        if not capture:
+            return
+        if re.fullmatch(r"NKDA|no known drug allergies", capture, re.I):
+            _add(capture)
+            return
+        parts = re.split(r"\s*,\s*|\s+and\s+|\s*;\s*", capture)
+        if len(parts) > 1:
+            for part in parts:
+                part = part.strip(" .,;")
+                if part:
+                    _add(part)
+            return
+        _add(capture)
+
     patterns = (
-        r"(?:allerg(?:y|ies)|adverse reaction(?:s)?)\s*(?:to|:)?\s*([A-Za-z0-9][A-Za-z0-9\s\-/,]{1,60})",
-        r"(?:NKDA|no known drug allergies)",
+        r"(?:allerg(?:y|ies)|adverse reaction(?:s)?)\s*(?:to|:)\s*([^\n.]{2,120})",
+        r"(?:known\s+)?allerg(?:y|ies)\s*:?\s*([^\n.]{2,120})",
+        r"\b(NKDA|no known drug allergies)\b",
     )
     for pattern in patterns:
         for match in re.finditer(pattern, text, re.I):
-            snippet = re.sub(r"\s+", " ", match.group(0)).strip(" .,;")
-            key = snippet.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append(snippet)
+            if match.lastindex:
+                _expand_capture(match.group(1))
+            else:
+                _expand_capture(match.group(0))
             if len(found) >= limit:
                 return found
+
+    for line in text.splitlines():
+        if not re.search(r"allerg", line, re.I):
+            continue
+        line_match = re.search(
+            r"(?:known\s+)?allerg(?:y|ies)\s*:?\s*(.+)$",
+            line.strip(),
+            re.I,
+        )
+        if line_match:
+            _expand_capture(line_match.group(1))
+        if len(found) >= limit:
+            return found
     return found
+
+
+def fetch_patient_document_texts(patient_id=None, max_docs: int = 3) -> list[str]:
+    """Full uploaded document text for allergy/annotation extraction (not truncated excerpts)."""
+    patient_id_int = _patient_id_int(resolve_patient_id(patient_id))
+    if patient_id_int is None:
+        return []
+    texts = []
+    try:
+        response = (
+            supabase.table("documents")
+            .select("raw_text")
+            .eq("patient_id", patient_id_int)
+            .order("created_at", desc=True)
+            .limit(max_docs)
+            .execute()
+        )
+        for row in response.data or []:
+            raw_text = str(row.get("raw_text") or "").strip()
+            if raw_text:
+                texts.append(raw_text)
+    except Exception:
+        pass
+    return texts
 
 
 def fetch_recent_document_excerpts(patient_id=None, max_docs: int = 2, max_chars: int = 700) -> list[dict]:
@@ -1149,20 +3034,104 @@ def fetch_recent_document_excerpts(patient_id=None, max_docs: int = 2, max_chars
 def get_patient_allergy_notes(patient_id=None) -> list[str]:
     allergies = []
     seen = set()
+
+    def _add_items(items: list) -> None:
+        for item in items:
+            key = str(item or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            allergies.append(str(item).strip())
+
     latest_plan = get_latest_patient_plan(patient_id)
     if latest_plan:
-        for item in extract_allergy_mentions_from_text(latest_plan.get("raw_text") or ""):
-            key = item.lower()
-            if key not in seen:
-                seen.add(key)
-                allergies.append(item)
-    for doc in fetch_recent_document_excerpts(patient_id):
-        for item in extract_allergy_mentions_from_text(doc.get("excerpt") or ""):
-            key = item.lower()
-            if key not in seen:
-                seen.add(key)
-                allergies.append(item)
+        _add_items(extract_allergy_mentions_from_text(latest_plan.get("raw_text") or ""))
+    for raw_text in fetch_patient_document_texts(patient_id):
+        _add_items(extract_allergy_mentions_from_text(raw_text))
+    if not allergies:
+        for doc in fetch_recent_document_excerpts(patient_id):
+            _add_items(extract_allergy_mentions_from_text(doc.get("excerpt") or ""))
     return allergies[:8]
+
+
+def symptom_suggests_allergic_reaction(symptom_text: str) -> bool:
+    return bool(ALLERGY_SYMPTOM_RE.search(str(symptom_text or "")))
+
+
+def build_allergy_symptom_prompt_block(symptom_text: str, allergies: list | None) -> str:
+    allergy_list = [str(item).strip() for item in (allergies or []) if str(item).strip()]
+    if not allergy_list or not symptom_suggests_allergic_reaction(symptom_text):
+        return ""
+    lines = [
+        "DOCUMENTED PATIENT ALLERGIES — REQUIRED FOR THIS SYMPTOM:",
+        "The reported symptom could indicate an allergic reaction. You MUST reference these known allergies "
+        "in empathetic_advice and ask whether any new medicine, food, or substance was introduced recently.",
+    ]
+    if reported_symptom_has_anaphylaxis_red_flags(symptom_text):
+        lines.append(
+            "- Severity: the report describes possible anaphylaxis red flags — classify as emergency."
+        )
+    else:
+        lines.append(
+            "- Severity: localized rash/hives/itching WITHOUT breathing difficulty, facial/throat swelling, "
+            "fainting, or rapid spread → contact_doctor. Do NOT use emergency unless those red flags are in the report."
+        )
+    for allergy in allergy_list:
+        lines.append(f"- {allergy}")
+    return "\n".join(lines)
+
+
+_UNGROUNDED_LINKED_REPORT_PATTERNS = (
+    re.compile(
+        r"(?is)\n*\*\*Connected to earlier reports:\*\*.*?(?=\n\n|\Z)"
+    ),
+    re.compile(
+        r"(?i)\b(?:based on|drawing on|using)\s+\d+\s+linked\s+reports?\b[^.\n]*\.?"
+    ),
+    re.compile(
+        r"(?i)\b(?:this follows|following|connected to|links to|linked to)\s+(?:your|the|an)?\s*(?:earlier|previous|prior)\s+report[^.\n]*\.?"
+    ),
+    re.compile(
+        r"(?i)\b(?:earlier|previous|prior)\s+report(?:s)?\s+(?:about|mentioning|noting|describing)\b[^.\n]*\.?"
+    ),
+    re.compile(
+        r"(?i)\b(?:confusion and fall both reported|fall and confusion reported)\s+this session\b[^.\n]*\.?"
+    ),
+    re.compile(
+        r"(?i)\batrial fibrillation\b[^.\n]*(?:earlier|previous|prior|linked|connected)\b[^.\n]*\.?"
+    ),
+)
+
+
+def strip_ungrounded_linked_report_citations(text: str) -> str:
+    """Remove linked-report language when no real session priors were supplied."""
+    cleaned = str(text or "")
+    for pattern in _UNGROUNDED_LINKED_REPORT_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def enforce_report_ask_session_evidence(
+    reply: str,
+    *,
+    prior_incidents: list | None,
+    session_triggers: list | None,
+    context_report_count: int | None,
+    patient_id=None,
+) -> tuple[str, list[str], int]:
+    """Structurally block linked-report claims without genuine same-session evidence."""
+    valid_prior = [
+        item
+        for item in (prior_incidents or [])
+        if session_incident_is_valid_for_patient(item, patient_id)
+    ]
+    triggers = list(session_triggers or [])
+    count = context_report_count if context_report_count is not None else 1
+    if valid_prior and triggers:
+        return reply, triggers, max(count, 1)
+    cleaned = strip_ungrounded_linked_report_citations(reply)
+    return cleaned, [], 1
 
 
 def build_patient_report_timeline_context(
@@ -1170,35 +3139,33 @@ def build_patient_report_timeline_context(
     session_incidents: list | None = None,
     limit: int = 10,
 ) -> str:
-    """Recent symptom reports from this session and stored shift logs."""
+    """Recent stored symptom reports for this patient — same source as Handover timelines."""
+    del session_incidents  # Session-only reports are passed separately to linking logic.
+    patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        return "RECENT SYMPTOM & CARE TIMELINE: No prior reports on file yet."
+
     lines = []
-    for incident in (session_incidents or [])[-limit:]:
-        text = str(incident.get("text") or incident.get("summary") or "").strip()
+    for row in fetch_patient_care_reports(patient_id, limit=limit):
+        text = str(row.get("report_text") or row.get("summary") or "").strip()
         if not text:
             continue
-        stamp = str(incident.get("timestamp_display") or "").strip()
-        severity = str(incident.get("severity") or "monitor")
-        lines.append(f"- [{stamp or 'This session'}] {text} (severity: {severity})")
-
-    remaining = max(0, limit - len(lines))
-    if remaining:
-        for row in fetch_symptom_shift_logs(patient_id, limit=limit * 2):
-            summary = str(row.get("summary") or "").strip()
-            if not summary:
-                continue
-            created_at = row.get("created_at") or ""
-            try:
-                stamp = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).strftime("%d %b %Y, %H:%M")
-            except (ValueError, TypeError):
-                stamp = str(created_at)[:16]
-            severity = str(row.get("severity") or "monitor")
-            lines.append(f"- [{stamp}] {summary} (severity: {severity})")
-            if len(lines) >= limit:
-                break
+        reported_raw = row.get("reported_at") or row.get("created_at") or ""
+        try:
+            stamp = datetime.fromisoformat(str(reported_raw).replace("Z", "+00:00")).strftime(
+                "%a %d %b, %I:%M %p"
+            ).lstrip("0")
+        except (ValueError, TypeError):
+            stamp = str(reported_raw)[:16]
+        severity = str(row.get("severity") or "monitor")
+        lines.append(f"- [{stamp or 'Unknown time'}] {text} (severity: {severity})")
 
     if not lines:
         return "RECENT SYMPTOM & CARE TIMELINE: No prior reports on file yet."
-    return "RECENT SYMPTOM & CARE TIMELINE (use to spot patterns and recurring symptoms):\n" + "\n".join(lines[:limit])
+    return (
+        "RECENT SYMPTOM & CARE TIMELINE (stored reports for this patient only — use to spot patterns):\n"
+        + "\n".join(lines[-limit:])
+    )
 
 
 def build_condition_analysis_prompt_block(analysis: dict | None) -> str:
@@ -1216,13 +3183,21 @@ def build_condition_analysis_prompt_block(analysis: dict | None) -> str:
             message = str(item.get("education_message") or "").strip()
             if name and message:
                 lines.append(f"  • {name}: {message}")
-    else:
-        lines.append("- No stored condition or medication links were flagged for this symptom.")
+    allergy_alerts = analysis.get("allergy_symptom_alerts") or []
+    if allergy_alerts:
+        lines.append("- Allergy links flagged for this symptom (MUST mention in your reply):")
+        for item in allergy_alerts:
+            name = str(item.get("condition_name") or "").strip()
+            message = str(item.get("education_message") or "").strip()
+            if name and message:
+                lines.append(f"  • {name}: {message}")
+    elif not relevant:
+        lines.append("- No stored condition, medication, or allergy links were flagged for this symptom.")
     recommended = str(analysis.get("recommended_severity") or "").strip()
     if recommended:
         lines.append(f"- Recommended severity from cross-check: {recommended}")
     lines.append(
-        "- Your empathetic_advice MUST reference the patient's actual conditions and medications above "
+        "- Your empathetic_advice MUST reference the patient's actual conditions, medications, and allergies above "
         "when they relate to this report. Never give a generic answer when patient-specific links exist."
     )
     return "\n".join(lines)
@@ -1528,6 +3503,76 @@ def save_patient_care_report(
     return local_saved
 
 
+def care_report_is_suspect_cross_profile_import(row: dict, patient: dict | None = None) -> bool:
+    """Drop rows that were bulk-imported onto the wrong patient profile."""
+    source = str(row.get("source") or "").strip().lower()
+    if source == "legacy_backfill":
+        return True
+
+    reported_raw = row.get("reported_at") or row.get("created_at") or ""
+    created_raw = row.get("created_at") or ""
+    summary_text = str(row.get("report_text") or row.get("summary") or "")
+    if _SHIFT_LOG_UTC_PREFIX.search(summary_text):
+        return True
+    if not reported_raw:
+        return False
+
+    try:
+        reported_at = datetime.fromisoformat(str(reported_raw).replace("Z", "+00:00"))
+        if reported_at.tzinfo is None:
+            reported_at = reported_at.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+    if patient and patient.get("created_at"):
+        try:
+            patient_created = datetime.fromisoformat(
+                str(patient["created_at"]).replace("Z", "+00:00")
+            )
+            if patient_created.tzinfo is None:
+                patient_created = patient_created.replace(tzinfo=timezone.utc)
+            if reported_at < patient_created - timedelta(hours=1):
+                return True
+        except (ValueError, TypeError):
+            pass
+
+    if created_raw and source in ("legacy_backfill", "shift_log", ""):
+        try:
+            saved_at = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+            if saved_at.tzinfo is None:
+                saved_at = saved_at.replace(tzinfo=timezone.utc)
+            if saved_at - reported_at > timedelta(days=1):
+                return True
+        except (ValueError, TypeError):
+            pass
+
+    return False
+
+
+def purge_suspect_cross_profile_care_reports(patient_id=None) -> int:
+    """Remove polluted legacy imports from local disk for one patient profile."""
+    patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        return 0
+    patient_row = get_patient_by_id(patient_id)
+
+    def _should_remove(row: dict) -> bool:
+        return care_report_is_suspect_cross_profile_import(row, patient_row)
+
+    return purge_local_care_reports(patient_id, should_remove=_should_remove)
+
+
+def purge_suspect_cross_profile_chat_messages(patient_id=None) -> int:
+    patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        return 0
+
+    def _should_remove(message: dict) -> bool:
+        return chat_message_is_suspect_cross_profile(message, patient_id)
+
+    return purge_local_chat_messages(patient_id, should_remove=_should_remove)
+
+
 def fetch_patient_care_reports(patient_id=None, limit: int = 500) -> list:
     """Load durable care reports for one patient, oldest-first for timelines."""
     patient_id = resolve_patient_id(patient_id)
@@ -1552,6 +3597,14 @@ def fetch_patient_care_reports(patient_id=None, limit: int = 500) -> list:
     merged = _merge_care_report_rows(local_rows, remote_rows)
     patient_row = get_patient_by_id(patient_id)
     merged = filter_production_care_rows(merged, patient_id, patient_row)
+    merged = [
+        row for row in merged
+        if not row.get("patient_id") or str(row.get("patient_id")) == str(patient_id)
+    ]
+    merged = [
+        row for row in merged
+        if not care_report_is_suspect_cross_profile_import(row, patient_row)
+    ]
     if limit and len(merged) > limit:
         return merged[-limit:]
     return merged
@@ -1591,6 +3644,7 @@ def sanitize_chat_message_for_storage(message: dict) -> dict | None:
         "content": str(message.get("content") or ""),
         "timestamp": message.get("timestamp") or "",
         "timestamp_display": message.get("timestamp_display") or "",
+        "caregiver_id": message.get("caregiver_id") or "",
         "severity": message.get("severity"),
         "has_image": bool(message.get("has_image")),
         "context_report_count": message.get("context_report_count"),
@@ -1599,17 +3653,69 @@ def sanitize_chat_message_for_storage(message: dict) -> dict | None:
     return {key: value for key, value in stored.items() if value not in (None, "", [])}
 
 
+def _chat_message_storage_key(message: dict) -> tuple:
+    return (
+        str(message.get("timestamp") or ""),
+        str(message.get("role") or ""),
+        str(message.get("content") or "")[:240],
+    )
+
+
+def merge_chat_messages_for_storage(existing: list | None, session_messages: list | None) -> list:
+    """Append new UI messages to durable chat history without dropping prior stored turns."""
+    merged = [dict(item) for item in (existing or []) if isinstance(item, dict)]
+    seen = {_chat_message_storage_key(item) for item in merged}
+    for message in session_messages or []:
+        cleaned = sanitize_chat_message_for_storage(message)
+        if not cleaned:
+            continue
+        key = _chat_message_storage_key(cleaned)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(cleaned)
+    return merged[-MAX_STORED_CHAT_MESSAGES:]
+
+
+def build_stored_chat_context_for_ai(patient_id=None, limit: int = 10) -> str:
+    """Compact prior chat transcript for AI prompts — not shown in the Report & Ask UI."""
+    patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        return ""
+    messages = fetch_patient_chat_thread(patient_id)
+    messages = [
+        message for message in messages
+        if isinstance(message, dict)
+        and not chat_message_is_suspect_cross_profile(message, patient_id)
+    ]
+    if not messages and not fetch_patient_care_reports(patient_id, limit=1):
+        return ""
+    if not messages:
+        return ""
+    lines = [
+        "STORED CONVERSATION HISTORY (prior Report & Ask messages — use for continuity; "
+        "the caregiver's current chat window started fresh):"
+    ]
+    for message in messages[-limit:]:
+        role = str(message.get("role") or "").strip()
+        content = re.sub(r"\s+", " ", str(message.get("content") or "")).strip()
+        if not role or not content:
+            continue
+        stamp = str(message.get("timestamp_display") or "").strip()
+        prefix = f"[{stamp}] " if stamp else ""
+        lines.append(f"- {prefix}{role}: {content[:280]}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
 def save_patient_chat_thread(patient_id, messages: list) -> bool:
     """Persist Report & Ask chat transcript for one patient profile."""
     patient_id = resolve_patient_id(patient_id)
     if not patient_id:
         return False
-    storable = []
-    for message in messages or []:
-        cleaned = sanitize_chat_message_for_storage(message)
-        if cleaned:
-            storable.append(cleaned)
-    storable = storable[-MAX_STORED_CHAT_MESSAGES:]
+    existing = fetch_patient_chat_thread(patient_id)
+    storable = merge_chat_messages_for_storage(existing, messages)
     local_saved = save_local_chat_thread(patient_id, storable)
     payload = {
         "patient_id": patient_id,
@@ -1642,6 +3748,7 @@ def fetch_patient_chat_thread(patient_id=None) -> list:
                 summary=str(message.get("content") or ""),
                 source="chat_message",
             )
+            and not chat_message_is_suspect_cross_profile(message, patient_id)
         ]
 
     try:
@@ -1794,11 +3901,297 @@ def ask_ai(system_prompt, user_content):
         }
     except Exception as e:
         logger.exception("ask_ai request failed")
+        details = str(e)
+        reason = classify_ai_failure_error(details)
         return {
             "error": True,
-            "message": "We couldn't process this right now. Please try again, or contact a healthcare provider if this is urgent.",
-            "details": str(e)
+            "reason": reason,
+            "message": ai_failure_user_message(reason),
+            "details": details,
         }
+
+
+AI_FAILURE_REASONS = frozenset({
+    "quota_exceeded",
+    "rate_limited",
+    "auth_error",
+})
+
+
+def classify_ai_failure_error(details: str) -> str:
+    """Map provider error text to a stable failure reason."""
+    lowered = str(details or "").lower()
+    if "insufficient_quota" in lowered or "exceeded your current quota" in lowered:
+        return "quota_exceeded"
+    if "rate_limit" in lowered or "error code: 429" in lowered:
+        return "rate_limited"
+    if "invalid_api_key" in lowered or "incorrect api key" in lowered or "error code: 401" in lowered:
+        return "auth_error"
+    return "unknown"
+
+
+def ai_failure_is_recoverable_offline(reason: str) -> bool:
+    return reason in ("quota_exceeded", "rate_limited")
+
+
+def ai_failure_user_message(reason: str) -> str:
+    if reason == "quota_exceeded":
+        return (
+            "AI analysis is temporarily unavailable because the OpenAI API quota has been exceeded. "
+            "CareShield can still read PDF text — try again after adding credits at platform.openai.com, "
+            "or contact a healthcare provider if this is urgent."
+        )
+    if reason == "rate_limited":
+        return (
+            "AI analysis is temporarily busy. Please wait a minute and try again, "
+            "or contact a healthcare provider if this is urgent."
+        )
+    if reason == "auth_error":
+        return (
+            "AI analysis is not configured correctly on this device. "
+            "Please check the OpenAI API key and try again."
+        )
+    return (
+        "We couldn't process this right now. Please try again, "
+        "or contact a healthcare provider if this is urgent."
+    )
+
+
+def _my_results_guess_document_type(file_name: str, raw_text: str) -> tuple[str, str]:
+    name_lower = str(file_name or "").lower()
+    text_lower = str(raw_text or "").lower()
+    if "cardiology" in name_lower or "cardiology" in text_lower:
+        return "Cardiology follow-up letter", "clinic_letter"
+    if any(token in name_lower for token in ("blood", "lab", "pathology")):
+        return "Laboratory results", "lab_panel"
+    if any(token in name_lower for token in ("scan", "xray", "x-ray", "mri", "ct")):
+        return "Imaging report", "imaging"
+    if "discharge" in name_lower:
+        return "Discharge summary", "discharge_summary"
+    if "referral" in name_lower:
+        return "Referral letter", "referral"
+    return "Clinic letter", "clinic_letter"
+
+
+def _my_results_first_sentences(text: str, max_sentences: int = 3, max_chars: int = 420) -> str:
+    cleaned = sanitize_my_results_plain_text(text)
+    if not cleaned:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    summary = " ".join(part for part in parts[:max_sentences] if part).strip()
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip() + "…"
+    return summary
+
+
+def build_my_results_offline_extract_from_text(raw_text: str, file_name: str = "") -> dict:
+    """Build a minimal structured extract from PDF text when AI is unavailable."""
+    text = str(raw_text or "").strip()
+    document_type, document_category = _my_results_guess_document_type(file_name, text)
+    source_match = re.search(
+        r"(?:from|at|referred to|clinic|hospital|department of)\s+([A-Z][A-Za-z0-9&'.,\- ]{3,60})",
+        text,
+    )
+    source = sanitize_my_results_plain_text(source_match.group(1) if source_match else "")
+    date_match = re.search(
+        r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b",
+        text,
+        re.I,
+    )
+    document_date = date_match.group(1) if date_match else "Unknown"
+
+    follow_ups = []
+    for match in re.finditer(
+        r"(follow[- ]?up(?:\s+clinic)?(?:\s+visit)?|clinic visit|review appointment|"
+        r"echocardiogram|echo(?:cardiogram)?|outpatient appointment)([^.;]{0,120})",
+        text,
+        re.I,
+    ):
+        phrase = sanitize_my_results_plain_text(match.group(0))
+        if not phrase or len(phrase) < 8:
+            continue
+        date_kind = "unspecified"
+        relative_phrase = ""
+        explicit_date = ""
+        relative_match = re.search(
+            r"\b(in\s+(?:one|two|three|four|five|six|eight|twelve|\d+)\s+(?:day|days|week|weeks|month|months))\b",
+            phrase,
+            re.I,
+        )
+        if relative_match:
+            date_kind = "relative"
+            relative_phrase = relative_match.group(1)
+        else:
+            explicit_match = re.search(
+                r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b",
+                phrase,
+                re.I,
+            )
+            if explicit_match:
+                date_kind = "explicit"
+                explicit_date = explicit_match.group(1)
+        follow_ups.append({
+            "description": phrase[:120],
+            "dateKind": date_kind,
+            "date": explicit_date,
+            "relativePhrase": relative_phrase,
+            "prep": "",
+        })
+        if len(follow_ups) >= 4:
+            break
+
+    medication_changes = []
+    for match in re.finditer(
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(\d+(?:\.\d+)?\s*mg(?:\s+(?:once|twice)\s+daily|[^.;]{0,40})?)",
+        text,
+    ):
+        medication = sanitize_my_results_plain_text(match.group(1))
+        detail = sanitize_my_results_plain_text(match.group(2))
+        if not medication:
+            continue
+        medication_changes.append({
+            "medication": medication,
+            "changeType": "start",
+            "detail": detail,
+        })
+        if len(medication_changes) >= 6:
+            break
+
+    caregiver_instructions = []
+    for match in re.finditer(
+        r"(seek (?:urgent|immediate) (?:care|medical attention)|contact (?:your|the) (?:gp|doctor)|"
+        r"if (?:you|she|he|they) (?:experience|develop|notice)[^.;]{0,140}|"
+        r"red flag[^.;]{0,120})",
+        text,
+        re.I,
+    ):
+        instruction = sanitize_my_results_plain_text(match.group(0))
+        if instruction:
+            caregiver_instructions.append({
+                "instruction": instruction,
+                "category": "red_flag" if "urgent" in instruction.lower() else "monitor",
+            })
+        if len(caregiver_instructions) >= 3:
+            break
+
+    if not caregiver_instructions:
+        summary = _my_results_first_sentences(text)
+        if summary:
+            caregiver_instructions.append({
+                "instruction": summary,
+                "category": "general",
+            })
+
+    return {
+        "documentType": document_type,
+        "documentCategory": document_category,
+        "date": document_date,
+        "source": source or "Unknown",
+        "readability": "clear",
+        "limitations": [
+            "AI analysis was unavailable, so this summary was built directly from the document text.",
+        ],
+        "newDiagnoses": [],
+        "medicationChanges": medication_changes,
+        "caregiverInstructions": caregiver_instructions,
+        "followUps": follow_ups,
+        "imagingFindings": [],
+        "results": [],
+        "backgroundConditions": [],
+        "labComment": "",
+        "priorComparisons": [],
+    }
+
+
+def build_my_results_offline_explain_from_extract(
+    extract: dict,
+    *,
+    patient_name: str = "",
+) -> dict:
+    extract = normalize_my_results_extract(extract)
+    doc_type = extract.get("documentType") or "medical document"
+    patient_label = patient_name or "the patient"
+    explanation = (
+        f"This {doc_type} for {patient_label} was read successfully. "
+        "Full AI explanation is temporarily unavailable, so the key points below were taken directly from the document."
+    )
+    questions = []
+    if extract.get("medicationChanges"):
+        questions.append({
+            "text": "Can you confirm the medication changes listed in this letter and explain how we should take them?",
+            "relatedCategory": "Medication changes",
+            "relatedTests": [],
+        })
+    if extract.get("followUps"):
+        first_follow = extract["followUps"][0]
+        description = first_follow.get("description") or "the follow-up appointment"
+        questions.append({
+            "text": f"What should we prepare for {description}?",
+            "relatedCategory": "Follow-up",
+            "relatedTests": [],
+        })
+    for instruction in extract.get("caregiverInstructions") or []:
+        if str(instruction.get("category") or "").lower() == "red_flag":
+            questions.append({
+                "text": "When should we seek urgent care based on the warning signs in this letter?",
+                "relatedCategory": "Safety",
+                "relatedTests": [],
+            })
+            break
+    if not questions:
+        questions.append({
+            "text": "Can you walk us through the main changes from this document at the next visit?",
+            "relatedCategory": doc_type,
+            "relatedTests": [],
+        })
+    note = None
+    if not my_results_has_abnormal_values(extract):
+        if my_results_has_key_findings(extract):
+            note = "This document did not include numeric lab results to flag."
+        else:
+            note = "No abnormal lab values were listed in this document."
+    return {
+        "explanation": explanation,
+        "trendCallouts": [],
+        "resultGroups": [],
+        "questions": questions,
+        "urgentCareInstructions": None,
+        "noAbnormalValuesNote": note,
+    }
+
+
+def build_my_results_record_from_offline_text(
+    raw_text: str,
+    *,
+    file_name: str,
+    patient_name: str,
+    known_conditions: list | None = None,
+) -> dict | None:
+    """Return a complete My Results record without calling the AI provider."""
+    extract = normalize_my_results_extract(
+        build_my_results_offline_extract_from_text(raw_text, file_name)
+    )
+    if not my_results_has_actionable_content(extract):
+        return None
+    explain = normalize_my_results_explain(
+        build_my_results_offline_explain_from_extract(extract, patient_name=patient_name),
+        extract=extract,
+        patient_name=patient_name,
+        known_conditions=known_conditions or [],
+        generate_missing_explanations=True,
+    )
+    if not my_results_explain_is_complete(explain, extract):
+        return None
+    return {**extract, **explain}
+
+
+def resolve_ai_failure_reason(error_payload: dict | None) -> str:
+    if not isinstance(error_payload, dict):
+        return "unknown"
+    reason = str(error_payload.get("reason") or "").strip()
+    if reason:
+        return reason
+    return classify_ai_failure_error(str(error_payload.get("details") or ""))
 
 
 def _build_openai_user_content(user_text="", image_b64=None, media_type="image/jpeg"):
@@ -1983,12 +4376,21 @@ def generate_handover_pdf(
     sbar_data=None,
     patient_label="Patient",
     photo_reviews=None,
+    adherence_events=None,
+    period_label="",
 ):
     """
     GP handover sheet with severity-coded timeline, timestamps,
     connected-report links, optional compact SBAR summary, and photo reviews.
     """
-    timeline_events = timeline_events or []
+    timeline_events = sorted(
+        timeline_events or [],
+        key=lambda item: str(item.get("timestamp") or ""),
+    )
+    adherence_events = sorted(
+        adherence_events or [],
+        key=lambda item: str(item.get("timestamp") or ""),
+    )
     connected_links = connected_links or []
     photo_reviews = photo_reviews or []
     buffer = BytesIO()
@@ -2045,12 +4447,13 @@ def generate_handover_pdf(
     story = []
 
     generated_at = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+    period_note = _pdf_escape(period_label) if period_label else "Selected period"
     page_note = "Printable summary"
     if photo_reviews:
-        page_note = "Printable summary · Photo reviews on page 2"
+        page_note = "Printable summary · Symptom photos included"
     story.append(Paragraph("CareShield — GP Handover Sheet", title_style))
     story.append(Paragraph(
-        f"{_pdf_escape(patient_label)} · Generated {generated_at} · {page_note}",
+        f"{_pdf_escape(patient_label)} · {period_note} · Generated {generated_at} · {page_note}",
         subtitle_style,
     ))
 
@@ -2121,11 +4524,11 @@ def generate_handover_pdf(
             Paragraph("<b>Report</b>", body_style),
             Paragraph("<b>Carer</b>", body_style),
         ]]
-        for event in timeline_events[-8:]:
+        for event in timeline_events:
             level = _normalize_pdf_severity(event.get("severity"))
             label, bg, fg = SEVERITY_PDF_META[level]
             time_text = _pdf_escape(event.get("timestamp_display") or "—")
-            report_text = _pdf_escape(event.get("text") or "")[:220]
+            report_text = _pdf_escape(event.get("text") or "")
             carer_text = _pdf_escape(event.get("caregiver") or "—")
             severity_cell = Paragraph(
                 f'<font color="{fg.hexval()}">●</font> <b>{label}</b>',
@@ -2154,24 +4557,83 @@ def generate_handover_pdf(
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]
-        for row_idx, event in enumerate(timeline_events[-8:], start=1):
+        for row_idx, event in enumerate(timeline_events, start=1):
             level = _normalize_pdf_severity(event.get("severity"))
             _, bg, _ = SEVERITY_PDF_META[level]
             row_styles.append(("BACKGROUND", (1, row_idx), (1, row_idx), bg))
         timeline_table.setStyle(TableStyle(row_styles))
         story.append(timeline_table)
-        if len(timeline_events) > 8:
-            story.append(Paragraph(
-                f"Showing latest 8 of {len(timeline_events)} logged reports.",
-                small_style,
-            ))
+        story.append(Paragraph(
+            f"{len(timeline_events)} symptom report(s) in this period.",
+            small_style,
+        ))
     else:
-        story.append(Paragraph("No reports logged yet this session.", body_style))
+        story.append(Paragraph("No symptom reports logged for this period.", body_style))
+
+    if adherence_events:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Medication adherence", section_style))
+        adherence_table_data = [[
+            Paragraph("<b>Time</b>", body_style),
+            Paragraph("<b>Status</b>", body_style),
+            Paragraph("<b>Entry</b>", body_style),
+            Paragraph("<b>Carer</b>", body_style),
+        ]]
+        adherence_styles = {
+            "taken": ("TAKEN", colors.HexColor("#D4EDDA"), colors.HexColor("#2D6A4F")),
+            "missed": ("MISSED", colors.HexColor("#FEE2E2"), colors.HexColor("#B91C1C")),
+            "check": ("MED CHECK", colors.HexColor("#E8F0FE"), colors.HexColor("#1D4ED8")),
+        }
+        for event in adherence_events:
+            status_key = str(event.get("adherence_status") or "check")
+            label, bg, fg = adherence_styles.get(
+                status_key,
+                adherence_styles["check"],
+            )
+            time_text = _pdf_escape(event.get("timestamp_display") or "—")
+            entry_text = _pdf_escape(event.get("text") or "")
+            carer_text = _pdf_escape(event.get("caregiver") or "—")
+            adherence_table_data.append([
+                Paragraph(time_text, body_style),
+                Paragraph(
+                    f'<font color="{fg.hexval()}">●</font> <b>{label}</b>',
+                    body_style,
+                ),
+                Paragraph(entry_text, body_style),
+                Paragraph(carer_text, small_style),
+            ])
+        adherence_table = Table(
+            adherence_table_data,
+            colWidths=[1.05 * inch, 1.05 * inch, 3.55 * inch, 0.95 * inch],
+            repeatRows=1,
+        )
+        adherence_row_styles = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1A2B23")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E8E4DA")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]
+        for row_idx, event in enumerate(adherence_events, start=1):
+            status_key = str(event.get("adherence_status") or "check")
+            _, bg, _ = adherence_styles.get(status_key, adherence_styles["check"])
+            adherence_row_styles.append(("BACKGROUND", (1, row_idx), (1, row_idx), bg))
+        adherence_table.setStyle(TableStyle(adherence_row_styles))
+        story.append(adherence_table)
+        story.append(Paragraph(
+            f"{len(adherence_events)} medication log(s) in this period.",
+            small_style,
+        ))
 
     if connected_links:
         story.append(Spacer(1, 6))
         story.append(Paragraph("Connected reports", section_style))
-        for link in connected_links[:4]:
+        for link in connected_links:
             related_lines = []
             for prior in link.get("connected_to") or []:
                 stamp = _pdf_escape(prior.get("timestamp_display") or prior.get("time") or "")
@@ -2193,7 +4655,7 @@ def generate_handover_pdf(
         story.append(PageBreak())
         story.append(Paragraph("Photo reviews", section_style))
         story.append(Paragraph(
-            "Caregiver photos submitted for symptom review or pill identification during this period.",
+            "Caregiver photos submitted for symptom review during this period.",
             small_style,
         ))
         story.append(Spacer(1, 4))
@@ -2328,6 +4790,31 @@ def get_relevant_medical_context(query: str, match_count: int = 3) -> str:
     except Exception:
         return ""
 
+def _build_medication_reference_description(
+    *,
+    pill_strength: float | None = None,
+    strength_unit: str = "mg",
+    brand: str = "",
+    pills_per_dose: int | None = None,
+    back_image_b64: str | None = None,
+) -> str:
+    payload_meta = {
+        "pill_strength": pill_strength,
+        "strength_unit": strength_unit,
+        "brand": str(brand or "").strip(),
+    }
+    if pills_per_dose is not None:
+        try:
+            count = int(pills_per_dose)
+            if 1 <= count <= 10:
+                payload_meta["pills_per_dose"] = count
+        except (TypeError, ValueError):
+            pass
+    if back_image_b64:
+        payload_meta["back_image_b64"] = back_image_b64
+    return json.dumps(payload_meta)
+
+
 def save_medication_reference(
     medication_name: str,
     image_b64: str,
@@ -2338,35 +4825,53 @@ def save_medication_reference(
     pills_per_dose: int | None = None,
     patient_id=None,
     back_image_b64: str | None = None,
-):
+) -> bool:
     """Saves a reference photo and pill strength metadata for one patient's medication."""
+    patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        logger.warning("save_medication_reference: missing patient_id for %s", medication_name)
+        return False
     if not description:
-        payload_meta = {
-            "pill_strength": pill_strength,
-            "strength_unit": strength_unit,
-            "brand": brand.strip(),
-        }
-        if pills_per_dose is not None:
-            try:
-                count = int(pills_per_dose)
-                if 1 <= count <= 10:
-                    payload_meta["pills_per_dose"] = count
-            except (TypeError, ValueError):
-                pass
-        if back_image_b64:
-            payload_meta["back_image_b64"] = back_image_b64
-        description = json.dumps(payload_meta)
+        description = _build_medication_reference_description(
+            pill_strength=pill_strength,
+            strength_unit=strength_unit,
+            brand=brand,
+            pills_per_dose=pills_per_dose,
+            back_image_b64=back_image_b64,
+        )
+    local_row = upsert_local_medication_reference(
+        patient_id,
+        medication_name=medication_name,
+        image_b64=image_b64,
+        description=description,
+    )
+    if not local_row:
+        return False
+
     payload = {
         "medication_name": medication_name,
         "image_b64": image_b64,
         "description": description,
-        "patient_id": resolve_patient_id(patient_id),
+        "patient_id": patient_id,
     }
     try:
         supabase.table("medication_references").insert(payload).execute()
-    except Exception:
-        payload.pop("patient_id", None)
-        supabase.table("medication_references").insert(payload).execute()
+    except Exception as exc:
+        logger.debug(
+            "save_medication_reference supabase insert with patient_id failed for %s: %s",
+            medication_name,
+            exc,
+        )
+        try:
+            payload.pop("patient_id", None)
+            supabase.table("medication_references").insert(payload).execute()
+        except Exception as fallback_exc:
+            logger.debug(
+                "save_medication_reference supabase fallback failed for %s: %s",
+                medication_name,
+                fallback_exc,
+            )
+    return True
 
 
 def upsert_medication_reference(
@@ -2378,22 +4883,9 @@ def upsert_medication_reference(
     pills_per_dose: int | None = None,
     patient_id=None,
     back_image_b64: str | None = None,
-):
+) -> bool:
     """Replace any existing reference for this medication on this patient, then save."""
-    patient_id = resolve_patient_id(patient_id)
-    try:
-        existing = (
-            supabase.table("medication_references")
-            .select("id")
-            .eq("patient_id", patient_id)
-            .eq("medication_name", medication_name)
-            .execute()
-        )
-    except Exception:
-        existing = supabase.table("medication_references").select("id").eq("medication_name", medication_name).execute()
-    for row in existing.data or []:
-        supabase.table("medication_references").delete().eq("id", row["id"]).execute()
-    save_medication_reference(
+    return save_medication_reference(
         medication_name=medication_name,
         image_b64=image_b64,
         pill_strength=pill_strength,
@@ -2413,12 +4905,20 @@ def update_medication_reference(
     brand: str | None = None,
     pills_per_dose: int | None = None,
     back_image_b64: str | None = None,
-):
+    patient_id=None,
+) -> bool:
     """Update pill strength metadata and optionally the reference photo."""
-    response = supabase.table("medication_references").select("*").eq("id", ref_id).limit(1).execute()
-    if not response.data:
-        return
-    ref = response.data[0]
+    patient_id = resolve_patient_id(patient_id)
+    local_rows = fetch_local_medication_references(patient_id) if patient_id else []
+    local_ref = next((row for row in local_rows if str(row.get("id")) == str(ref_id)), None)
+
+    ref = local_ref
+    if not ref:
+        response = supabase.table("medication_references").select("*").eq("id", ref_id).limit(1).execute()
+        if not response.data:
+            return False
+        ref = response.data[0]
+
     try:
         meta = json.loads(ref.get("description") or "{}")
         if not isinstance(meta, dict):
@@ -2440,14 +4940,42 @@ def update_medication_reference(
             pass
     if back_image_b64:
         meta["back_image_b64"] = back_image_b64
-    updates = {"description": json.dumps(meta)}
+    description = json.dumps(meta)
+    updates = {"description": description}
     if image_b64:
         updates["image_b64"] = image_b64
-    supabase.table("medication_references").update(updates).eq("id", ref_id).execute()
+
+    if patient_id and local_ref:
+        updated = update_local_medication_reference(
+            patient_id,
+            ref_id,
+            image_b64=image_b64,
+            description=description,
+        )
+        if not updated:
+            return False
+
+    try:
+        supabase.table("medication_references").update(updates).eq("id", ref_id).execute()
+    except Exception as exc:
+        logger.debug("update_medication_reference supabase failed for ref %s: %s", ref_id, exc)
+        if patient_id and local_ref:
+            return True
+        return False
+    return True
+
 
 def get_medication_references(patient_id=None) -> list:
     """Returns saved medication reference photos for one patient."""
     patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        logger.debug("get_medication_references: no patient_id — returning []")
+        return []
+
+    local_rows = fetch_local_medication_references(patient_id)
+    if local_rows:
+        return local_rows
+
     try:
         response = (
             supabase.table("medication_references")
@@ -2457,21 +4985,34 @@ def get_medication_references(patient_id=None) -> list:
             .execute()
         )
         return response.data or []
-    except Exception:
-        try:
-            response = supabase.table("medication_references").select("*").order("created_at").execute()
-            return response.data or []
-        except Exception:
-            return []
+    except Exception as exc:
+        logger.warning(
+            "get_medication_references failed for patient %s: %s",
+            patient_id,
+            exc,
+        )
+        return []
 
 
-def delete_medication_reference(ref_id: int, patient_id=None):
+def delete_medication_reference(ref_id: int, patient_id=None) -> bool:
     """Deletes a medication reference by id, scoped to patient when possible."""
     patient_id = resolve_patient_id(patient_id)
+    deleted_local = False
+    if patient_id:
+        deleted_local = delete_local_medication_reference(patient_id, ref_id)
     try:
-        supabase.table("medication_references").delete().eq("id", ref_id).eq("patient_id", patient_id).execute()
-    except Exception:
-        supabase.table("medication_references").delete().eq("id", ref_id).execute()
+        if patient_id:
+            supabase.table("medication_references").delete().eq("id", ref_id).eq("patient_id", patient_id).execute()
+        else:
+            supabase.table("medication_references").delete().eq("id", ref_id).execute()
+    except Exception as exc:
+        logger.debug("delete_medication_reference supabase failed for ref %s: %s", ref_id, exc)
+        if not deleted_local:
+            try:
+                supabase.table("medication_references").delete().eq("id", ref_id).execute()
+            except Exception:
+                return deleted_local
+    return deleted_local or True
 
 
 def log_medication_prn_taken(
@@ -2494,6 +5035,8 @@ def log_medication_prn_taken(
 
 def get_medication_logs(patient_id=None):
     patient_id = resolve_patient_id(patient_id)
+    if not patient_id:
+        return []
     try:
         response = (
             supabase.table("medication_logs")
@@ -4065,8 +6608,6 @@ def backfill_legacy_shift_logs_to_local_care(patient_id=None, limit: int = 500) 
     if not patient_id or legacy_backfill_completed(patient_id):
         return 0
 
-    patients = list_account_patients()
-    allow_unmarked = len(patients) == 1 or not any_other_patient_has_local_reports(patient_id)
     try:
         response = (
             supabase.table("shift_logs")
@@ -4084,15 +6625,12 @@ def backfill_legacy_shift_logs_to_local_care(patient_id=None, limit: int = 500) 
     for row in rows:
         if not shift_log_is_symptom_event(row):
             continue
+        if not shift_log_belongs_to_patient(row, patient_id):
+            continue
         summary = str(row.get("summary") or "").strip()
         if not summary:
             continue
-        if summary_matches_shift_log_patient(summary, patient_id):
-            target_patient = patient_id
-        elif allow_unmarked and "[[patient:" not in summary:
-            target_patient = patient_id
-        else:
-            continue
+        target_patient = patient_id
         clean_summary = strip_shift_log_patient_marker(summary)
         if shift_log_row_is_internal_test({
             "summary": clean_summary,
@@ -4105,7 +6643,7 @@ def backfill_legacy_shift_logs_to_local_care(patient_id=None, limit: int = 500) 
             report_text=clean_summary,
             summary=clean_summary,
             severity=row.get("severity", "monitor"),
-            source=row.get("source", "voice_report"),
+            source="legacy_backfill",
             reported_at=row.get("created_at"),
             caregiver_name=row.get("caregiver_name", "Caregiver"),
             caregiver_id=row.get("caregiver_id"),
@@ -4135,12 +6673,20 @@ def fetch_symptom_shift_logs(patient_id=None, limit: int = 250) -> list:
         response = query.execute()
         rows = response.data or []
         if rows:
-            return rows
+            scoped = [
+                row for row in rows
+                if shift_log_belongs_to_patient(row, patient_id)
+            ]
+            if scoped:
+                return scoped[:limit]
     except Exception as exc:
         logger.debug("symptom shift_logs filtered query failed: %s", exc)
 
     rows = fetch_shift_logs(patient_id, limit=max(limit * 4, 500))
-    symptom_rows = [row for row in rows if shift_log_is_symptom_event(row)]
+    symptom_rows = [
+        row for row in rows
+        if shift_log_is_symptom_event(row) and shift_log_belongs_to_patient(row, patient_id)
+    ]
     return symptom_rows[:limit]
 
 
@@ -4199,7 +6745,10 @@ def purge_internal_test_patient_artifacts(patient_id=None) -> dict:
 
 def fetch_medication_check_shift_logs(patient_id=None, limit: int = 100) -> list:
     rows = fetch_shift_logs(patient_id, limit=max(limit * 4, 250))
-    medcam_rows = [row for row in rows if shift_log_is_adherence_event(row)]
+    medcam_rows = [
+        row for row in rows
+        if shift_log_is_adherence_event(row) and shift_log_belongs_to_patient(row, patient_id)
+    ]
     return medcam_rows[:limit]
 
 

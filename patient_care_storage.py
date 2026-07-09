@@ -37,6 +37,10 @@ def _chat_path(patient_id: str) -> Path:
     return _patient_dir(patient_id) / "chat_thread.json"
 
 
+def _medication_references_path(patient_id: str) -> Path:
+    return _patient_dir(patient_id) / "medication_references.json"
+
+
 def _photos_dir(patient_id: str) -> Path:
     photos_dir = _patient_dir(patient_id) / "photos"
     photos_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +157,41 @@ def fetch_local_care_reports(patient_id: str, limit: int = 500) -> list:
     return rows
 
 
+def replace_local_care_reports(patient_id: str, rows: list) -> None:
+    patient_id = str(patient_id).strip()
+    if not patient_id:
+        return
+    with _LOCK:
+        _write_json_list(_reports_path(patient_id), list(rows or []))
+
+
+def purge_local_care_reports(patient_id: str, *, should_remove) -> int:
+    """Drop local care report rows matched by should_remove(row) -> bool."""
+    patient_id = str(patient_id).strip()
+    if not patient_id:
+        return 0
+    removed = 0
+    reports_path = _reports_path(patient_id)
+    with _LOCK:
+        rows = _read_json_list(reports_path)
+        kept = []
+        for row in rows:
+            if should_remove(row):
+                removed += 1
+                report_id = row.get("id")
+                if report_id:
+                    photo_path = _photos_dir(patient_id) / f"{report_id}.json"
+                    try:
+                        photo_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            else:
+                kept.append(row)
+        if removed:
+            _write_json_list(reports_path, kept)
+    return removed
+
+
 def purge_local_internal_test_entries(patient_id: str, *, is_test_row) -> int:
     """Remove rows matched by is_test_row from local care reports and chat."""
     patient_id = str(patient_id).strip()
@@ -247,6 +286,51 @@ def save_local_chat_thread(patient_id: str, messages: list) -> bool:
         return False
 
 
+def replace_local_chat_thread(patient_id: str, messages: list) -> None:
+    patient_id = str(patient_id).strip()
+    if not patient_id:
+        return
+    payload = {
+        "patient_id": patient_id,
+        "messages": messages or [],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _LOCK:
+        _chat_path(patient_id).write_text(
+            json.dumps(payload, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+
+def purge_local_chat_messages(patient_id: str, *, should_remove) -> int:
+    patient_id = str(patient_id).strip()
+    if not patient_id:
+        return 0
+    path = _chat_path(patient_id)
+    if not path.exists():
+        return 0
+    removed = 0
+    with _LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list):
+            return 0
+        kept = []
+        for message in messages:
+            if isinstance(message, dict) and should_remove(message):
+                removed += 1
+            else:
+                kept.append(message)
+        if removed:
+            payload["messages"] = kept
+            payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+            path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return removed
+
+
 def fetch_local_chat_thread(patient_id: str) -> list:
     patient_id = str(patient_id).strip()
     if not patient_id:
@@ -296,3 +380,152 @@ def any_other_patient_has_local_reports(patient_id: str) -> bool:
         if _read_json_list(path):
             return True
     return False
+
+
+def fetch_local_medication_references(patient_id: str) -> list:
+    patient_id = str(patient_id).strip()
+    if not patient_id:
+        return []
+    rows = _read_json_list(_medication_references_path(patient_id))
+    rows.sort(key=lambda item: str(item.get("created_at") or ""))
+    return rows
+
+
+def save_local_medication_reference(
+    patient_id: str,
+    *,
+    medication_name: str,
+    image_b64: str,
+    description: str = "",
+) -> dict | None:
+    patient_id = str(patient_id).strip()
+    medication_name = str(medication_name or "").strip()
+    image_b64 = str(image_b64 or "").strip()
+    if not patient_id or not medication_name or not image_b64:
+        return None
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = {
+        "id": f"local-{uuid.uuid4().hex[:12]}",
+        "patient_id": patient_id,
+        "medication_name": medication_name,
+        "image_b64": image_b64,
+        "description": description or "",
+        "created_at": now_iso,
+    }
+    path = _medication_references_path(patient_id)
+    with _LOCK:
+        rows = _read_json_list(path)
+        rows.append(row)
+        rows.sort(key=lambda item: str(item.get("created_at") or ""))
+        _write_json_list(path, rows)
+    return row
+
+
+def upsert_local_medication_reference(
+    patient_id: str,
+    *,
+    medication_name: str,
+    image_b64: str,
+    description: str = "",
+) -> dict | None:
+    patient_id = str(patient_id).strip()
+    medication_name = str(medication_name or "").strip()
+    if not patient_id or not medication_name:
+        return None
+    path = _medication_references_path(patient_id)
+    with _LOCK:
+        rows = _read_json_list(path)
+        med_lower = medication_name.lower()
+        rows = [
+            row for row in rows
+            if str(row.get("medication_name") or "").strip().lower() != med_lower
+        ]
+        _write_json_list(path, rows)
+    return save_local_medication_reference(
+        patient_id,
+        medication_name=medication_name,
+        image_b64=image_b64,
+        description=description,
+    )
+
+
+def update_local_medication_reference(
+    patient_id: str,
+    ref_id,
+    *,
+    image_b64: str | None = None,
+    description: str | None = None,
+) -> dict | None:
+    patient_id = str(patient_id).strip()
+    ref_key = str(ref_id or "").strip()
+    if not patient_id or not ref_key:
+        return None
+    path = _medication_references_path(patient_id)
+    updated = None
+    with _LOCK:
+        rows = _read_json_list(path)
+        for index, row in enumerate(rows):
+            if str(row.get("id") or "") != ref_key:
+                continue
+            next_row = dict(row)
+            if image_b64:
+                next_row["image_b64"] = image_b64
+            if description is not None:
+                next_row["description"] = description
+            rows[index] = next_row
+            updated = next_row
+            break
+        if updated:
+            _write_json_list(path, rows)
+    return updated
+
+
+def delete_local_medication_reference(patient_id: str, ref_id) -> bool:
+    patient_id = str(patient_id).strip()
+    ref_key = str(ref_id or "").strip()
+    if not patient_id or not ref_key:
+        return False
+    path = _medication_references_path(patient_id)
+    removed = False
+    with _LOCK:
+        rows = _read_json_list(path)
+        kept = [row for row in rows if str(row.get("id") or "") != ref_key]
+        removed = len(kept) != len(rows)
+        if removed:
+            _write_json_list(path, kept)
+    return removed
+
+
+def _caregiver_profiles_path() -> Path:
+    return _DATA_ROOT / "caregiver_profiles.json"
+
+
+def load_saved_caregiver_profiles() -> dict | None:
+    path = _caregiver_profiles_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("profiles"), list):
+            return data
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read caregiver profiles: %s", exc)
+    return None
+
+
+def save_caregiver_profiles(profiles: list, selected_caregiver_id: str) -> None:
+    payload = {
+        "profiles": profiles or [],
+        "selected_caregiver_id": str(selected_caregiver_id or "").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with _LOCK:
+            _DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            _caregiver_profiles_path().write_text(
+                json.dumps(payload, indent=2, default=str),
+                encoding="utf-8",
+            )
+    except OSError as exc:
+        logger.warning("Could not save caregiver profiles: %s", exc)

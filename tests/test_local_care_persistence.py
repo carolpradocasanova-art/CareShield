@@ -10,6 +10,7 @@ import patient_care_storage as storage
 from ai_helpers import (
     fetch_patient_care_reports,
     fetch_patient_chat_thread,
+    merge_chat_messages_for_storage,
     save_patient_care_report,
     save_patient_chat_thread,
     save_shift_log,
@@ -49,6 +50,32 @@ class LocalCarePersistenceTests(unittest.TestCase):
         loaded = fetch_patient_chat_thread("11")
         self.assertEqual(len(loaded), 2)
         self.assertEqual(loaded[0]["content"], "Fever overnight")
+
+    def test_chat_thread_appends_without_dropping_prior_history(self):
+        prior = [
+            {"role": "user", "content": "Older report", "timestamp": "2026-07-01T08:00:00+00:00"},
+            {"role": "assistant", "content": "Older reply", "timestamp": "2026-07-01T08:01:00+00:00"},
+        ]
+        self.assertTrue(save_patient_chat_thread("12", prior))
+        session_only = [
+            {"role": "welcome", "content": "Welcome"},
+            {"role": "user", "content": "New dizziness today", "timestamp": "2026-07-04T09:00:00+00:00"},
+            {"role": "assistant", "content": "Monitor and call GP if worse.", "timestamp": "2026-07-04T09:01:00+00:00"},
+        ]
+        self.assertTrue(save_patient_chat_thread("12", session_only))
+        loaded = fetch_patient_chat_thread("12")
+        self.assertEqual(len(loaded), 4)
+        self.assertEqual(loaded[0]["content"], "Older report")
+        self.assertEqual(loaded[-1]["content"], "Monitor and call GP if worse.")
+
+    def test_merge_chat_messages_for_storage_dedupes(self):
+        existing = [{"role": "user", "content": "Same", "timestamp": "t1"}]
+        session = [
+            {"role": "user", "content": "Same", "timestamp": "t1"},
+            {"role": "user", "content": "New", "timestamp": "t2"},
+        ]
+        merged = merge_chat_messages_for_storage(existing, session)
+        self.assertEqual(len(merged), 2)
 
     def test_save_shift_log_falls_back_without_patient_id_column(self):
         with patch("ai_helpers.supabase") as mock_supabase:

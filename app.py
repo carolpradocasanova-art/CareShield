@@ -10,6 +10,18 @@ import json
 import re
 import textwrap
 from io import BytesIO, StringIO
+from symptom_linking import (
+    SYMPTOM_PATTERN_DEFINITIONS,
+    count_linked_reports,
+    count_linked_session_reports,
+    detect_session_escalation_triggers,
+    detect_session_symptom_recurrence,
+    extract_symptoms_from_text,
+    find_symptom_related_prior_incidents,
+    incident_symptom_relevance_score,
+    resolve_incident_symptom_keys,
+    select_linked_prior_incidents,
+)
 from ai_helpers import (
     ask_ai,
     ask_ai_chat,
@@ -21,12 +33,31 @@ from ai_helpers import (
     extract_text_from_pdf_with_meta,
     pdf_extraction_error_response,
     validate_document_patient_profile,
+    account_is_multi_patient,
     analyze_symptom_against_conditions,
     extract_relevant_condition_risks,
     escalate_severity,
     build_condition_analysis_prompt_block,
     build_patient_report_timeline_context,
     get_patient_allergy_notes,
+    get_patient_medications_for_symptom_context,
+    build_stored_chat_context_for_ai,
+    build_allergy_symptom_prompt_block,
+    build_patient_claim_grounding_prompt_block,
+    cap_allergy_report_severity,
+    chat_thread_has_user_content,
+    chat_thread_belongs_to_caregiver,
+    apply_report_severity_floor_caps,
+    cap_positive_report_severity,
+    cap_informational_question_severity,
+    is_clearly_positive_benign_report,
+    is_pure_informational_care_question,
+    is_care_question_text,
+    reports_health_symptom_topic,
+    enforce_report_ask_session_evidence,
+    enforce_active_patient_name_in_text,
+    enforce_patient_record_grounding_in_reply,
+    extract_unverified_patient_claims,
     fetch_recent_document_excerpts,
     save_patient_plan,
     get_latest_patient_plan,
@@ -70,7 +101,10 @@ from ai_helpers import (
     my_results_has_actionable_content,
     count_my_results_review_items,
     build_my_results_explain_payload,
+    build_my_results_record_from_offline_text,
     build_openai_user_content,
+    ai_failure_is_recoverable_offline,
+    resolve_ai_failure_reason,
     shift_log_is_internal_storage,
     fetch_symptom_shift_logs,
     fetch_medication_check_shift_logs,
@@ -78,10 +112,15 @@ from ai_helpers import (
     fetch_patient_care_reports,
     fetch_patient_care_report_photo,
     save_patient_chat_thread,
-    fetch_patient_chat_thread,
     strip_shift_log_patient_marker,
+    format_medcam_shift_log_for_timeline,
+    shift_log_belongs_to_patient,
     backfill_legacy_shift_logs_to_local_care,
     purge_internal_test_patient_artifacts,
+    purge_suspect_cross_profile_care_reports,
+    purge_suspect_cross_profile_chat_messages,
+    session_incident_is_valid_for_patient,
+    normalize_condition_since,
 )
 from care_data_quality import (
     care_row_is_internal_test,
@@ -117,17 +156,33 @@ from medcam_dose_cards import (
     build_medcam_prn_dose_card_html,
     build_medcam_scheduled_dose_card_html,
 )
+from medcam_pill_rows import (
+    build_medcam_reference_thumb_html,
+    build_medcam_row_html_from_display,
+)
+from medication_dose_queries import (
+    build_next_medication_reply_core,
+    extract_medication_name_from_question,
+)
 from handover_events import (
     HANDOVER_INSUFFICIENT_DATA_MSG,
     HANDOVER_PERIOD_OPTIONS,
+    build_reported_by_entries_from_events,
     build_sbar_handover_user_payload,
     collect_sbar_events_from_timelines,
+    enrich_handover_result_with_period_entries,
     event_in_handover_period,
     filter_events_by_handover_period,
     get_handover_period_bounds,
     get_handover_period_label,
+    handover_events_signature,
+    handover_severity_label,
     parse_handover_datetime,
     partition_timeline_events_for_sbar,
+    REPORT_HISTORY_DEFAULT_VISIBLE,
+    REPORT_HISTORY_EXPAND_BATCH,
+    count_chat_user_reports,
+    slice_messages_for_report_history,
 )
 from pathlib import Path
 from streamlit_javascript import st_javascript
@@ -143,6 +198,7 @@ if not logging.getLogger().handlers:
 
 ADD_NEW_PROFILE_OPTION = "+ Add new profile"
 ADD_NEW_PATIENT_OPTION = "+ Add new patient"
+CARE_DATA_SCHEMA_VERSION = 3
 
 DEFAULT_CAREGIVER_PROFILES = [
     {"id": "carlos", "name": "Carlos", "role": "son"},
@@ -164,6 +220,11 @@ _CARESHIELD_ICON_PATH = _APP_DIR / "assets" / "careshield-icon.png"
 _careshield_icon_b64_cache: tuple[int, str] | None = None
 _my_results_logger = logging.getLogger("careshield.my_results")
 _documents_logger = logging.getLogger("careshield.documents")
+_report_ask_logger = logging.getLogger("careshield.report_ask")
+
+
+def care_hydrate_key(patient_id=None) -> str:
+    return f"care_hydrated_v{CARE_DATA_SCHEMA_VERSION}_{resolve_patient_id(patient_id)}"
 
 
 def get_careshield_icon_b64() -> str:
@@ -320,16 +381,15 @@ def normalize_conditions_raw(raw) -> list:
                 name = str(entry.get("name") or entry.get("condition") or "").strip()
                 if not name:
                     continue
-                onset = str(
+                onset = normalize_condition_since(
                     entry.get("onset_date")
                     or entry.get("onset")
                     or entry.get("since")
                     or entry.get("date")
-                    or "Unknown"
-                ).strip()
+                )
                 items.append({
                     "name": name,
-                    "since": onset or "Unknown",
+                    "since": onset,
                     "badge": normalize_condition_status(
                         entry.get("status") or entry.get("type") or entry.get("badge")
                     ),
@@ -1139,8 +1199,10 @@ def build_careshield_logo_html(include_tagline: bool = True) -> str:
     """
 
 
-HANDOVER_TIMELINE_DEFAULT_VISIBLE = 2
-HANDOVER_TIMELINE_EXPAND_BATCH = 3
+HANDOVER_TIMELINE_DEFAULT_VISIBLE = REPORT_HISTORY_DEFAULT_VISIBLE
+HANDOVER_TIMELINE_EXPAND_BATCH = REPORT_HISTORY_EXPAND_BATCH
+CHAT_REPORT_HISTORY_DEFAULT_VISIBLE = REPORT_HISTORY_DEFAULT_VISIBLE
+CHAT_REPORT_HISTORY_EXPAND_BATCH = REPORT_HISTORY_EXPAND_BATCH
 
 def filter_session_incidents_by_period(period_key: str, tz_obj, patient_id=None) -> list:
     return filter_events_by_handover_period(
@@ -1151,10 +1213,67 @@ def filter_session_incidents_by_period(period_key: str, tz_obj, patient_id=None)
 
 
 def get_session_photo_reviews_for_handover(period_key: str, tz_obj) -> list:
-    return [
-        incident for incident in filter_session_incidents_by_period(period_key, tz_obj)
-        if incident.get("source") in ("symptom_photo", "pill_photo") and incident.get("image_b64")
-    ]
+    return get_handover_photo_reviews_for_period(
+        st.session_state.get("selected_patient_id"),
+        period_key,
+        tz_obj,
+    )
+
+
+def resolve_timeline_event_image_b64(event: dict, patient_id=None) -> str:
+    image_b64 = str(event.get("image_b64") or "").strip()
+    if image_b64:
+        return image_b64
+    if event.get("has_photo") and event.get("report_id") is not None:
+        return fetch_patient_care_report_photo(
+            event["report_id"],
+            patient_id=patient_id,
+        ) or ""
+    return ""
+
+
+def timeline_event_has_photo_review(event: dict, patient_id=None) -> bool:
+    source = str(event.get("source") or "")
+    if source in ("symptom_photo", "pill_photo"):
+        return bool(resolve_timeline_event_image_b64(event, patient_id))
+    return bool(event.get("has_photo") and resolve_timeline_event_image_b64(event, patient_id))
+
+
+def get_handover_photo_reviews_for_period(patient_id, period_key: str, tz_obj) -> list:
+    """All caregiver photo submissions in the selected handover period."""
+    resolved_patient_id = resolve_patient_id(patient_id)
+    symptom_events = filter_events_by_handover_period(
+        load_symptom_timeline_events(patient_id=resolved_patient_id),
+        period_key,
+        tz_obj,
+    )
+    reviews = []
+    for event in symptom_events:
+        if not timeline_event_has_photo_review(event, resolved_patient_id):
+            continue
+        image_b64 = resolve_timeline_event_image_b64(event, resolved_patient_id)
+        if not image_b64:
+            continue
+        reviews.append({
+            **event,
+            "image_b64": image_b64,
+            "summary": event.get("text") or "",
+        })
+    return reviews
+
+
+def attach_timeline_event_photos(events: list, patient_id=None) -> list:
+    """Load durable symptom photos onto timeline rows for handover display/PDF."""
+    resolved_id = resolve_patient_id(patient_id)
+    enriched = []
+    for event in events or []:
+        row = dict(event)
+        if not row.get("image_b64"):
+            image_b64 = resolve_timeline_event_image_b64(row, resolved_id)
+            if image_b64:
+                row["image_b64"] = image_b64
+        enriched.append(row)
+    return enriched
 
 
 def filter_shift_logs_by_period(logs: list, period_key: str, tz_obj) -> list:
@@ -1237,6 +1356,9 @@ WRITING STYLE (critical):
   Bad: "Chest pain at 17:19, 17:49, and 18:10."
 - Keep specific numbers only when clinically meaningful as a summary — e.g. "blood pressure stayed elevated around 158/95 across several readings this afternoon" — but never enumerate every reading with its own time.
 - Connect related incidents (e.g. confusion earlier and a fall later) and note if urgency increased over time.
+- When the same concern is reported more than once, reflect the HIGHEST severity reached (e.g. if first logged as CONTACT DOCTOR and later EMERGENCY, state EMERGENCY explicitly and mention 999/112 if that was recommended).
+- Every line in SYMPTOM REPORTS includes a severity label in square brackets — preserve those levels; never soften EMERGENCY to vague concern language.
+- SYMPTOM PHOTOS LOGGED must be mentioned in Assessment (bruise, rash, swelling, etc.) — these are clinically important visual findings.
 - Do not drop or soften anything clinically important — preserve severity, red flags, and medication issues — just phrase them in human language.
 
 Respond with ONLY a JSON object:
@@ -1347,8 +1469,55 @@ def refresh_chat_welcome_message(caregiver_label: str) -> None:
         messages[0]["content"] = build_welcome_message(caregiver_label)
 
 
+def reset_report_ask_for_caregiver_switch(
+    patient_id: str | None,
+    caregiver_label: str,
+    caregiver_id: str,
+    *,
+    previous_caregiver_id: str | None = None,
+) -> None:
+    """Start a fresh visible chat when the logged-in caregiver profile changes."""
+    resolved_patient = resolve_patient_id(patient_id) if patient_id else None
+    if resolved_patient and chat_thread_has_user_content(st.session_state.get("messages")):
+        persist_patient_chat_thread(resolved_patient)
+
+    st.session_state.messages = build_initial_chat_messages(caregiver_label)
+    st.session_state.chat_caregiver = caregiver_label
+    st.session_state.chat_caregiver_id = caregiver_id
+    st.session_state.report_ask_bound_caregiver_id = caregiver_id
+    st.session_state.pop("pending_chat_response", None)
+    st.session_state.reset_chat_draft = True
+
+    if resolved_patient:
+        st.session_state[get_session_incidents_key(resolved_patient)] = []
+
+    if previous_caregiver_id and previous_caregiver_id != caregiver_id:
+        _report_ask_logger.info(
+            "Caregiver switch: patient=%s previous_caregiver=%s new_caregiver=%s — chat reset",
+            resolved_patient,
+            previous_caregiver_id,
+            caregiver_id,
+        )
+
+
 def build_initial_chat_messages(caregiver_label: str):
     return [{"role": "assistant", "content": build_welcome_message(caregiver_label), "welcome": True}]
+
+
+def report_ask_needs_caregiver_reset(
+    selected_caregiver_id: str,
+    messages: list | None = None,
+) -> bool:
+    """Detect when Report & Ask visible chat belongs to a different caregiver profile."""
+    bound_caregiver_id = st.session_state.get("report_ask_bound_caregiver_id")
+    if bound_caregiver_id != selected_caregiver_id:
+        return True
+    session_chat_caregiver_id = st.session_state.get("chat_caregiver_id")
+    if session_chat_caregiver_id and session_chat_caregiver_id != selected_caregiver_id:
+        return True
+    if not chat_thread_belongs_to_caregiver(messages or st.session_state.get("messages"), selected_caregiver_id):
+        return True
+    return False
 
 
 def format_message_content(msg: dict) -> str:
@@ -1396,7 +1565,12 @@ CHAT_URGENCY_RULES = """URGENCY CLASSIFICATION — use exactly one of these four
   • Fever above 38°C (100.4°F)
   • Any symptom that is worsening over time
   Cross-reference PATIENT STORED CONDITIONS: if a symptom is more dangerous because of ANY stored chronic condition (e.g. fever with diabetes, COPD, or kidney disease), ALWAYS classify as "contact_doctor" or "emergency" — never "monitor".
-- "emergency": life-threatening — call 999/112 immediately (chest pain, stroke signs, severe breathing difficulty, etc.).
+- "emergency": life-threatening — call 999/112 immediately (chest pain, stroke signs, severe breathing difficulty, anaphylaxis with breathing difficulty or facial/throat swelling, etc.).
+
+ALLERGY / REACTION SEVERITY:
+- A documented allergy on file does NOT by itself mean emergency.
+- Mild or localized rash, hives, or itching (no breathing difficulty, no facial/throat swelling, no fainting) → "contact_doctor", never "emergency".
+- Use "emergency" for allergic reactions only when the caregiver's report describes red flags: difficulty breathing, lip/tongue/throat/facial swelling, wheeze, fainting, collapse, or rapidly spreading whole-body reaction.
 
 DYNAMIC CONDITION CROSS-CHECK:
 - CareShield evaluates every new symptom against the patient's full stored condition list using medical knowledge — not a hardcoded rule table.
@@ -1404,26 +1578,39 @@ DYNAMIC CONDITION CROSS-CHECK:
 
 Set "needs_doctor": true when severity is "contact_doctor"."""
 
+CHAT_INFORMATIONAL_QUESTION_RULES = """INFORMATIONAL QUESTIONS — no urgency tag unless the caregiver reports a concern:
+- When the caregiver asks a general medication or care question WITHOUT reporting a new or worsening symptom, use severity "ok" and needs_doctor false.
+- Examples that stay "ok": "How is his Furosemide working?", "Can he take Metformin and Lisinopril together?", "What is Furosemide for?"
+- Only use monitor/contact_doctor/emergency when the caregiver's own words report or ask about a symptom, side effect, or concern (e.g. swelling, dizziness, not working, getting worse).
+- Do NOT raise severity because your answer mentions possible side effects or stored conditions — classify based on what the caregiver actually said."""
+
 CHAT_SESSION_RULES = """SESSION MEMORY — this is an ongoing conversation, not a single isolated message:
-- Review PRIOR SESSION REPORTS below and connect related symptoms across messages.
+- Review PRIOR SESSION REPORTS below and connect related symptoms across messages from THIS browser session only.
+- If PRIOR SESSION REPORTS says "None yet this session", do NOT reference earlier reports, linked reports, prior incidents, or counts of linked reports — reason only from the current message plus stored medications/conditions/timeline.
+- Never invent or guess timestamps, falls, diagnoses, or prior incidents that are not explicitly listed in the context blocks below.
 - If an earlier report mentions confusion and a new report mentions a fall (or the reverse), explicitly link them, increase urgency, and explain why the combination matters.
-- Recurrent or worsening incidents across the session should increase urgency — never treat a new report in isolation when prior reports exist.
+- Recurrent or worsening incidents across the session should increase urgency — never treat a new report in isolation when prior session reports exist.
 - Briefly remind the carer that every incident is timestamped, stored for the session, and available to download in the Handover tab.
 - When you spot a connection, name the earlier report and its time (e.g. "This follows your 10:15 report about confusion")."""
 
 CHAT_SYMPTOM_PERSONALIZATION_RULES = """PERSONALIZATION — mandatory on every symptom report and care question:
 - The patient's conditions, medications, allergies, documents, and timeline are on file above. NEVER give a generic answer when this data exists.
 - Name the patient's specific diagnoses and medicines when they help explain the reported symptom.
-- Explain how the symptom may or may not relate to their known conditions or medications whenever appropriate.
+- For rash, hives, swelling, breathing difficulty, or skin reactions: always check PATIENT ALLERGIES and ask about any recently introduced medicine or substance.
+- For dizziness, fatigue, or other possible side effects: flag recently started or changed medicines from the medication list and notes.
+- Explain how the symptom may or may not relate to their known conditions, medications, or allergies whenever appropriate.
 - If PRE-COMPUTED SYMPTOM–PATIENT CROSS-CHECK is provided, weave those links into empathetic_advice in warm, plain language.
-- Examples: swelling + heart failure on file → mention heart failure; unusual bruising + anticoagulant on file → mention the medicine."""
+- Examples: swelling + heart failure on file → mention heart failure; dizziness + recently started ACE inhibitor → mention the medicine; rash + penicillin allergy on file → mention the allergy."""
 
 CHAT_SINGLE_PATIENT_RULES = """SINGLE-PATIENT FAMILY ACCOUNT — critical:
 - This CareShield account is for ONE patient only. They are always registered and on file for this family.
+- ACTIVE PATIENT NAME is shown in the patient context block below. ALWAYS refer to the patient using that exact name in every response.
+- NEVER use a different personal name from the caregiver's message, even if they mistype, mention another family member, or use the wrong name by accident.
 - The caregiver may say "my son", "my dad", "Mum", or "the patient" — they always mean the same patient whose medications and conditions are listed below.
 - NEVER refuse medication, dosing, or schedule questions by claiming the patient is not registered, not in the system, or that you cannot advise on their medications.
 - When asked what pills to give and when, answer directly from PATIENT STORED MEDICATIONS with specific drug names and times.
-- If one detail is missing from the plan, say what IS on file and suggest checking the Documents tab — do not refuse the whole question."""
+- If one detail is missing from the plan, say what IS on file and suggest checking the Documents tab — do not refuse the whole question.
+- If the caregiver asks about a surgery, procedure, or diagnosis that is NOT in stored conditions, documents, or timeline, say clearly that CareShield has no record of it — never answer as if confirmed."""
 
 SESSION_HANDOVER_NOTE = (
     "\n\n**Session log:** This update is timestamped and saved. "
@@ -1582,6 +1769,29 @@ def format_chat_timestamp(dt=None, tz_name=None) -> str:
     return datetime.now().strftime("%a %d %b, %I:%M %p").lstrip("0")
 
 
+def render_history_show_more_controls(
+    *,
+    hidden_count: int,
+    total: int,
+    shown_count: int,
+    session_key: str,
+    show_more_key: str,
+    batch: int = HANDOVER_TIMELINE_EXPAND_BATCH,
+    default_visible: int = HANDOVER_TIMELINE_DEFAULT_VISIBLE,
+) -> None:
+    """Display-only pagination controls for report history lists."""
+    if total == 0:
+        return
+    if hidden_count == 0:
+        if total > default_visible:
+            st.caption("All reports shown.")
+        return
+    next_batch = min(batch, hidden_count)
+    if st.button(f"Show {next_batch} more", key=show_more_key, use_container_width=True):
+        st.session_state[session_key] = shown_count + next_batch
+        st.rerun()
+
+
 def get_session_incidents_key(patient_id=None) -> str:
     resolved = resolve_patient_id(
         patient_id if patient_id is not None else st.session_state.get("selected_patient_id")
@@ -1597,13 +1807,21 @@ def get_session_incidents(patient_id=None) -> list:
     )
     if is_designated_test_patient(resolved_id, get_patient_by_id(resolved_id)):
         return incidents
-    return [incident for incident in incidents if not care_row_is_internal_test(incident)]
+    filtered = [
+        incident for incident in incidents
+        if not care_row_is_internal_test(incident)
+        and session_incident_is_valid_for_patient(incident, resolved_id)
+    ]
+    if len(filtered) != len(incidents):
+        st.session_state[key] = filtered
+    return filtered
 
 
 def clear_session_patient_state(previous_patient_id: str, caregiver_label: str | None = None) -> None:
     """Drop in-memory state for the previous patient when switching."""
     prev_key = get_session_incidents_key(previous_patient_id)
     st.session_state.pop(prev_key, None)
+    invalidate_patient_activity_cache(previous_patient_id)
     st.session_state.pop(f"stored_conditions_{previous_patient_id}", None)
     st.session_state.pop(f"stored_medications_{previous_patient_id}", None)
     st.session_state.pop(f"med_plan_meta_{previous_patient_id}", None)
@@ -1618,11 +1836,12 @@ def clear_session_patient_state(previous_patient_id: str, caregiver_label: str |
     st.session_state.pop("last_sbar_result", None)
     st.session_state.pop("pending_chat_response", None)
     st.session_state.pop("pill_modal", None)
-    st.session_state.pop(f"care_hydrated_{resolve_patient_id(previous_patient_id)}", None)
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith("care_hydrated_"):
+            st.session_state.pop(key, None)
+    st.session_state.pop("messages", None)
     if caregiver_label:
         st.session_state.reset_chat_draft = True
-    else:
-        st.session_state.pop("messages", None)
 
 
 def format_patient_label(patient: dict) -> str:
@@ -1663,10 +1882,15 @@ def add_patient_dialog() -> None:
                 st.error(error or "Could not save patient.")
             else:
                 previous_id = st.session_state.get("selected_patient_id")
+                caregiver_label = get_caregiver_profile_label(
+                    st.session_state.get("selected_caregiver_id", "")
+                )
                 if previous_id:
-                    caregiver_label = get_caregiver_profile_label(st.session_state.get("selected_caregiver_id", ""))
                     clear_session_patient_state(str(previous_id), caregiver_label)
-                st.session_state.selected_patient_id = str(patient["id"])
+                new_patient_id = str(patient["id"])
+                st.session_state.selected_patient_id = new_patient_id
+                invalidate_patient_activity_cache(new_patient_id)
+                hydrate_patient_care_session(new_patient_id, caregiver_label)
                 st.session_state.pop("open_add_patient_dialog", None)
                 st.session_state.pop("patient_profile_picker", None)
                 st.session_state.pop("add_patient_name", None)
@@ -2022,7 +2246,7 @@ def record_session_incident(
 
     summary_for_log = str(entry.get("summary") or text or "").strip()
     if summary_for_log and patient_id:
-        save_patient_care_report(
+        saved_report = save_patient_care_report(
             patient_id,
             report_text=text,
             summary=summary_for_log,
@@ -2035,6 +2259,8 @@ def record_session_incident(
             photo_type=photo_type,
             image_b64=image_b64,
         )
+        if saved_report and saved_report.get("id") is not None:
+            entry["report_id"] = saved_report["id"]
         if save_shift_log(
             caregiver_name=resolve_caregiver_label(resolved_id) or caregiver,
             source=source,
@@ -2084,6 +2310,10 @@ def care_report_row_to_timeline_event(row: dict) -> dict:
         "caregiver": row.get("caregiver_name") or resolve_caregiver_label(row.get("caregiver_id")),
         "source": row.get("source", "voice_report"),
         "symptoms": extract_symptoms_from_text(text),
+        "report_id": row.get("id"),
+        "has_photo": bool(row.get("has_photo")),
+        "photo_finding": row.get("photo_finding") or "",
+        "photo_type": row.get("photo_type") or "",
     }
 
 
@@ -2100,15 +2330,28 @@ def hydrate_patient_care_session(patient_id, caregiver_label: str) -> None:
         return
 
     purge_internal_test_patient_artifacts(patient_id)
+    removed_suspect = purge_suspect_cross_profile_care_reports(patient_id)
+    removed_chat = purge_suspect_cross_profile_chat_messages(patient_id)
+    if removed_suspect or removed_chat:
+        _report_ask_logger.info(
+            "Purged polluted profile data patient=%s care_reports=%d chat_messages=%d",
+            patient_id,
+            removed_suspect,
+            removed_chat,
+        )
     st.session_state.pop(f"care_reports_timeline_{patient_id}", None)
     st.session_state.pop(f"symptom_timeline_db_{patient_id}", None)
 
+    multi_patient_account = account_is_multi_patient(patient_id)
+
     reports = fetch_patient_care_reports(patient_id, limit=500)
-    if not reports:
+    if not reports and not multi_patient_account:
         backfill_legacy_shift_logs_to_local_care(patient_id, limit=500)
         reports = fetch_patient_care_reports(patient_id, limit=500)
-    if not reports:
+    if not reports and not multi_patient_account:
         for row in fetch_symptom_shift_logs(patient_id, limit=500):
+            if not shift_log_belongs_to_patient(row, patient_id):
+                continue
             summary = strip_shift_log_patient_marker(str(row.get("summary") or "").strip())
             if not summary:
                 continue
@@ -2117,7 +2360,7 @@ def hydrate_patient_care_session(patient_id, caregiver_label: str) -> None:
                 report_text=summary,
                 summary=summary,
                 severity=row.get("severity", "monitor"),
-                source=row.get("source", "voice_report"),
+                source="legacy_backfill",
                 reported_at=row.get("created_at"),
                 caregiver_name=row.get("caregiver_name", "Caregiver"),
                 caregiver_id=row.get("caregiver_id"),
@@ -2125,50 +2368,40 @@ def hydrate_patient_care_session(patient_id, caregiver_label: str) -> None:
             if saved:
                 reports.append(saved)
 
-    st.session_state[get_session_incidents_key(patient_id)] = [
-        care_report_row_to_session_incident(row) for row in reports
-    ]
+    st.session_state[get_session_incidents_key(patient_id)] = []
 
-    stored_messages = fetch_patient_chat_thread(patient_id)
-    if stored_messages:
-        st.session_state.messages = (
-            build_initial_chat_messages(caregiver_label) + stored_messages
-        )
-    else:
-        st.session_state.messages = build_initial_chat_messages(caregiver_label)
+    # Fresh visible chat on each page load; durable history stays in care_reports + chat_thread.
+    st.session_state.messages = build_initial_chat_messages(caregiver_label)
+    st.session_state.chat_caregiver = caregiver_label
+    st.session_state.chat_caregiver_id = resolve_caregiver_id(
+        st.session_state.get("selected_caregiver_id") or caregiver_label
+    )
+    st.session_state.report_ask_bound_caregiver_id = st.session_state.chat_caregiver_id
 
     st.session_state.pop(f"care_reports_timeline_{patient_id}", None)
     st.session_state.pop(f"symptom_timeline_db_{patient_id}", None)
-    st.session_state[f"care_hydrated_{patient_id}"] = True
+    st.session_state[care_hydrate_key(patient_id)] = True
+    cleanup_orphaned_session_incidents(patient_id)
 
 
-def migrate_legacy_session_incidents(patient_id=None) -> None:
-    """Merge any orphaned in-memory incident lists into the active patient bucket."""
+def cleanup_orphaned_session_incidents(patient_id=None) -> None:
+    """Drop stray in-memory incident buckets — never merge across profiles."""
     patient_id = resolve_patient_id(patient_id or st.session_state.get("selected_patient_id"))
     if not patient_id:
         return
     target_key = get_session_incidents_key(patient_id)
-    merged = list(st.session_state.get(target_key, []))
-    seen = {
-        (row.get("timestamp"), str(row.get("text") or "")[:120], row.get("source", ""))
-        for row in merged
-    }
-    changed = False
-    for key, value in list(st.session_state.items()):
+
+    for key in list(st.session_state.keys()):
         if not isinstance(key, str) or not key.startswith("session_incidents_"):
             continue
-        if key == target_key or not isinstance(value, list):
+        if key == target_key:
             continue
-        for row in value:
-            marker = (row.get("timestamp"), str(row.get("text") or "")[:120], row.get("source", ""))
-            if marker in seen:
-                continue
-            seen.add(marker)
-            merged.append(row)
-            changed = True
         st.session_state.pop(key, None)
-    if changed:
-        st.session_state[target_key] = merged
+
+
+def migrate_legacy_session_incidents(patient_id=None) -> None:
+    """Backward-compatible alias — safe cleanup only, no cross-patient merge when multi-patient."""
+    cleanup_orphaned_session_incidents(patient_id)
 
 
 def load_symptom_events_from_chat_messages(patient_id=None) -> list:
@@ -2194,6 +2427,12 @@ def load_symptom_events_from_chat_messages(patient_id=None) -> list:
         timestamp = message.get("timestamp") or ""
         if not timestamp:
             continue
+        message_caregiver_id = message.get("caregiver_id") or caregiver_id
+        message_caregiver = (
+            resolve_caregiver_label(message_caregiver_id)
+            if message_caregiver_id
+            else caregiver
+        )
         severity = "monitor"
         if index + 1 < len(messages) and messages[index + 1].get("role") == "assistant":
             severity = messages[index + 1].get("severity", "monitor")
@@ -2203,33 +2442,12 @@ def load_symptom_events_from_chat_messages(patient_id=None) -> list:
             "timestamp_display": message.get("timestamp_display") or format_chat_timestamp(timestamp),
             "text": text,
             "severity": normalize_chat_severity(severity),
-            "caregiver": caregiver,
+            "caregiver": message_caregiver,
+            "caregiver_id": message_caregiver_id,
             "source": source,
             "symptoms": extract_symptoms_from_text(text),
         })
     return events
-
-
-SYMPTOM_PATTERN_DEFINITIONS = (
-    ("confusion", r"confus", "Confusion"),
-    ("fall", r"\bfell\b|\bfall\b|\bfallen\b", "Falls"),
-    ("fever", r"fever|temperature", "Fever"),
-    ("swelling", r"swell|swollen|swelling", "Swelling"),
-    ("blood_pressure", r"blood pressure|\bbp\b", "Blood pressure"),
-    ("pain", r"\bpain\b|ache| hurting", "Pain"),
-    ("nausea", r"nause|vomit", "Nausea or vomiting"),
-    ("breathing", r"breath|breathing", "Breathing difficulty"),
-)
-
-
-def extract_symptoms_from_text(text: str) -> list[str]:
-    if not text:
-        return []
-    found = []
-    for key, pattern, _label in SYMPTOM_PATTERN_DEFINITIONS:
-        if re.search(pattern, text, re.I):
-            found.append(key)
-    return found
 
 
 def detect_recurring_symptom_patterns(incidents: list | None = None, min_count: int = 3) -> list[dict]:
@@ -2296,8 +2514,8 @@ def merge_symptom_condition_analysis(
     return severity, reply, relevant, needs_doctor
 
 
-def build_session_reports_context() -> str:
-    incidents = get_session_incidents()
+def build_session_reports_context(patient_id=None) -> str:
+    incidents = get_session_incidents(patient_id)
     if not incidents:
         return "PRIOR SESSION REPORTS: None yet this session."
     lines = ["PRIOR SESSION REPORTS (timestamped — connect related symptoms across these):"]
@@ -2309,49 +2527,29 @@ def build_session_reports_context() -> str:
     return "\n".join(lines)
 
 
-def detect_session_escalation_triggers(current_text: str, prior_incidents: list) -> list[str]:
-    if not current_text or not prior_incidents:
-        return []
-
-    triggers = []
-    prior_text = " ".join(str(item.get("text", "")) for item in prior_incidents).lower()
-    current_lower = current_text.lower()
-    combined = f"{prior_text} {current_lower}"
-
-    if re.search(r"confus", prior_text) and re.search(r"\bfell\b|\bfall\b|\bfallen\b", current_lower):
-        triggers.append("confusion followed by fall in this session")
-    elif re.search(r"\bfell\b|\bfall\b|\bfallen\b", prior_text) and re.search(r"confus", current_lower):
-        triggers.append("fall and confusion reported in this session")
-
-    for pattern, label in (
-        (r"confus", "recurrent confusion"),
-        (r"\bfell\b|\bfall\b|\bfallen\b", "recurrent falls"),
-        (r"fever|temperature", "recurrent fever"),
-        (r"swell|swollen|swelling", "recurrent swelling"),
-        (r"blood pressure|\bbp\b", "recurrent blood pressure concerns"),
-    ):
-        if re.search(pattern, prior_text) and re.search(pattern, current_lower):
-            triggers.append(f"{label} in this session")
-            break
-
-    if re.search(r"(?:worsening|getting worse|worse than|not improving)", current_lower) and prior_text.strip():
-        triggers.append("worsening pattern across session reports")
-
-    if re.search(r"confus", combined) and re.search(r"\bfell\b|\bfall\b|\bfallen\b", combined):
-        if "confusion followed by fall in this session" not in triggers and "fall and confusion reported in this session" not in triggers:
-            triggers.append("confusion and fall both reported this session")
-
-    return triggers
-
-
-def build_session_connection_note(prior_incidents: list, session_triggers: list[str]) -> str:
-    if not session_triggers or not prior_incidents:
+def build_session_connection_note(
+    prior_incidents: list,
+    session_triggers: list[str],
+    current_text: str = "",
+    patient_id=None,
+) -> str:
+    if not session_triggers or not prior_incidents or not current_text:
         return ""
-    recent = [item for item in prior_incidents if item.get("text")][-2:]
+    valid_priors = [
+        item for item in prior_incidents
+        if session_incident_is_valid_for_patient(item, patient_id)
+    ]
+    if not valid_priors:
+        return ""
+    recent = select_linked_prior_incidents(
+        current_text,
+        valid_priors,
+        session_triggers=session_triggers,
+    )
     if not recent:
         return ""
     links = "; ".join(
-        f"{item['timestamp_display']} — {item['text'][:80]}"
+        f"{item.get('timestamp_display') or item.get('timestamp') or 'Earlier'} — {item['text'][:80]}"
         for item in recent
     )
     trigger_text = ", ".join(session_triggers)
@@ -2368,13 +2566,16 @@ def resolve_chat_severity(
     needs_doctor: bool = False,
     prior_incidents: list | None = None,
 ) -> tuple[str, list[str]]:
+    if is_clearly_positive_benign_report(user_text):
+        return "ok", []
+    if is_pure_informational_care_question(user_text):
+        return "ok", []
+
     prior = prior_incidents or []
-    prior_text = " ".join(str(item.get("text", "")) for item in prior if item.get("text"))
-    combined_text = f"{prior_text} {user_text}".strip()
 
     level = apply_contact_doctor_escalation(severity, user_text, needs_doctor=needs_doctor)
     if level != "emergency":
-        if detect_contact_doctor_triggers(combined_text) and level in ("ok", "monitor"):
+        if detect_contact_doctor_triggers(user_text) and level in ("ok", "monitor"):
             level = "contact_doctor"
         session_triggers = detect_session_escalation_triggers(user_text, prior)
         if session_triggers and level in ("ok", "monitor"):
@@ -2389,11 +2590,28 @@ def resolve_chat_severity(
                     f"recurring {item['label'].lower()} ({item['count']} reports)"
                     for item in recurring
                 ]
-        if (
-            re.search(r"confus", combined_text, re.I)
-            and re.search(r"\bfell\b|\bfall\b|\bfallen\b", combined_text, re.I)
-            and re.search(r"hit head|head injury|unconscious|passed out|won'?t wake", combined_text, re.I)
-        ):
+        has_confusion = bool(re.search(r"confus", user_text, re.I)) or any(
+            re.search(r"confus", str(item.get("text") or item.get("summary") or ""), re.I)
+            for item in prior
+        )
+        has_fall = bool(re.search(r"\bfell\b|\bfall\b|\bfallen\b", user_text, re.I)) or any(
+            re.search(r"\bfell\b|\bfall\b|\bfallen\b", str(item.get("text") or item.get("summary") or ""), re.I)
+            for item in prior
+        )
+        has_head_injury = bool(
+            re.search(r"hit head|head injury|unconscious|passed out|won'?t wake", user_text, re.I)
+        ) or any(
+            re.search(r"hit head|head injury|unconscious|passed out|won'?t wake", str(item.get("text") or ""), re.I)
+            for item in prior
+        )
+        current_contributes = bool(
+            re.search(
+                r"confus|\bfell\b|\bfall\b|\bfallen\b|hit head|head injury|unconscious|passed out|won'?t wake",
+                user_text,
+                re.I,
+            )
+        )
+        if has_confusion and has_fall and has_head_injury and current_contributes:
             level = "emergency"
     else:
         session_triggers = detect_session_escalation_triggers(user_text, prior)
@@ -2411,28 +2629,6 @@ def severity_badge_html(severity: str) -> str:
     }
     label = labels.get(level, level.upper())
     return f'<div class="cs-msg-severity-banner cs-tag-{level}">{label}</div>'
-
-
-def count_linked_reports(
-    prior_incidents: list,
-    user_text: str,
-    session_triggers: list | None = None,
-) -> int:
-    if not prior_incidents:
-        return 1
-    current_keys = set(extract_symptoms_from_text(user_text))
-    linked_prior = sum(
-        1
-        for incident in prior_incidents
-        if current_keys & set(
-            incident.get("symptoms") or extract_symptoms_from_text(incident.get("text", ""))
-        )
-    )
-    if linked_prior:
-        return 1 + linked_prior
-    if session_triggers:
-        return 1 + len(prior_incidents)
-    return 1
 
 
 def severity_header_html(severity: str, context_report_count: int | None = None) -> str:
@@ -2485,20 +2681,55 @@ def _timeline_sort_key(event: dict) -> str:
     return str(event.get("timestamp") or "")
 
 
+def _severity_rank(severity: str) -> int:
+    from handover_events import SEVERITY_RANK, normalize_handover_severity
+    return SEVERITY_RANK.get(normalize_handover_severity(severity), 0)
+
+
+def _merge_timeline_duplicate(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing)
+    for key in (
+        "report_id",
+        "image_b64",
+        "photo_finding",
+        "photo_type",
+        "timestamp_display",
+        "caregiver",
+        "symptoms",
+    ):
+        if incoming.get(key):
+            merged[key] = incoming[key]
+    if _severity_rank(incoming.get("severity")) > _severity_rank(merged.get("severity")):
+        merged["severity"] = incoming.get("severity")
+    merged["has_photo"] = bool(
+        merged.get("has_photo")
+        or incoming.get("has_photo")
+        or merged.get("image_b64")
+        or incoming.get("image_b64")
+        or str(merged.get("source") or "") in ("symptom_photo", "pill_photo")
+        or str(incoming.get("source") or "") in ("symptom_photo", "pill_photo")
+    )
+    return merged
+
+
 def _dedupe_timeline_events(events: list) -> list:
-    seen = set()
-    unique = []
+    merged_by_key: dict[tuple, dict] = {}
+    order: list[tuple] = []
     for event in sorted(events, key=_timeline_sort_key):
+        if not (event.get("text") or "").strip():
+            continue
         dedupe_key = (
             str(event.get("timestamp") or "")[:19],
             (event.get("text") or "")[:100],
             event.get("source", ""),
         )
-        if dedupe_key in seen or not (event.get("text") or "").strip():
+        existing = merged_by_key.get(dedupe_key)
+        if existing:
+            merged_by_key[dedupe_key] = _merge_timeline_duplicate(existing, event)
             continue
-        seen.add(dedupe_key)
-        unique.append(event)
-    return unique
+        merged_by_key[dedupe_key] = dict(event)
+        order.append(dedupe_key)
+    return [merged_by_key[key] for key in order]
 
 
 def load_symptom_timeline_events(force_refresh: bool = False, patient_id=None) -> list:
@@ -2514,37 +2745,24 @@ def load_symptom_timeline_events(force_refresh: bool = False, patient_id=None) -
         except Exception:
             persisted_events = []
 
-        if not persisted_events:
-            legacy_events = []
-            try:
-                for row in fetch_symptom_shift_logs(patient_id, limit=500):
-                    created_at = row.get("created_at") or ""
-                    summary_text = strip_shift_log_patient_marker(str(row.get("summary") or "").strip())
-                    legacy_events.append({
-                        "timestamp": created_at,
-                        "timestamp_display": format_chat_timestamp(created_at),
-                        "text": summary_text,
-                        "severity": row.get("severity", "monitor"),
-                        "caregiver": resolve_caregiver_label(row.get("caregiver_id")) or row.get("caregiver_name", ""),
-                        "source": row.get("source", "report"),
-                        "symptoms": extract_symptoms_from_text(summary_text),
-                    })
-            except Exception:
-                legacy_events = []
-            persisted_events = legacy_events
-
         st.session_state[cache_key] = persisted_events
 
     session_events = []
     for incident in get_session_incidents(patient_id):
+        source = incident.get("source", "voice_report")
         session_events.append({
             "timestamp": incident.get("timestamp") or "",
             "timestamp_display": incident.get("timestamp_display") or format_chat_timestamp(incident.get("timestamp")),
             "text": incident.get("text") or incident.get("summary") or "",
             "severity": incident.get("severity", "monitor"),
             "caregiver": resolve_caregiver_label(incident.get("caregiver_id")) or incident.get("caregiver", ""),
-            "source": incident.get("source", "voice_report"),
+            "source": source,
             "symptoms": incident.get("symptoms") or extract_symptoms_from_text(incident.get("text", "")),
+            "image_b64": incident.get("image_b64") or "",
+            "has_photo": bool(incident.get("image_b64")) or source in ("symptom_photo", "pill_photo"),
+            "photo_finding": incident.get("photo_finding") or "",
+            "photo_type": incident.get("photo_type") or "",
+            "report_id": incident.get("report_id"),
         })
 
     return _dedupe_timeline_events(
@@ -2588,10 +2806,11 @@ def load_medication_adherence_timeline_events(patient_id, force_refresh: bool = 
         resolved_patient_id = resolve_patient_id(patient_id or st.session_state.get("selected_patient_id"))
         for row in fetch_medication_check_shift_logs(resolved_patient_id, limit=100):
             created_at = row.get("created_at") or ""
+            raw_summary = row.get("summary") or "MedCam medication check"
             events.append({
                 "timestamp": created_at,
                 "timestamp_display": format_chat_timestamp(created_at),
-                "text": row.get("summary") or "MedCam medication check",
+                "text": format_medcam_shift_log_for_timeline(raw_summary),
                 "severity": row.get("severity", "monitor"),
                 "caregiver": resolve_caregiver_label(row.get("caregiver_id")) or row.get("caregiver_name", ""),
                 "source": "medication_check",
@@ -2626,7 +2845,9 @@ def build_connected_report_links(incidents: list | None = None) -> list[dict]:
                 triggers = [f"recurring {item['label'].lower()}" for item in recurring]
         if not triggers:
             continue
-        related = [item for item in prior if item.get("text")][-2:]
+        related = select_linked_prior_incidents(text, prior, session_triggers=triggers)
+        if not related:
+            continue
         links.append({
             "time": incident.get("timestamp_display", ""),
             "report": text,
@@ -2758,27 +2979,22 @@ def render_paginated_handover_timeline(
         show_hidden_indicator=hidden_count > 0,
         timeline_kind=timeline_kind,
     ))
-    if hidden_count > 0 or shown_count > HANDOVER_TIMELINE_DEFAULT_VISIBLE:
-        btn_left, btn_right = st.columns(2)
-        if hidden_count > 0:
-            batch = min(HANDOVER_TIMELINE_EXPAND_BATCH, hidden_count)
-            with btn_left:
-                if st.button(f"Show {batch} more", key=button_key):
-                    st.session_state[visible_session_key] = shown_count + batch
-                    st.rerun()
-        if shown_count > HANDOVER_TIMELINE_DEFAULT_VISIBLE:
-            with btn_right if hidden_count > 0 else btn_left:
-                if st.button("Show less", key=f"{button_key}_less"):
-                    st.session_state[visible_session_key] = max(
-                        HANDOVER_TIMELINE_DEFAULT_VISIBLE,
-                        shown_count - HANDOVER_TIMELINE_EXPAND_BATCH,
-                    )
-                    st.rerun()
+    if hidden_count > 0:
+        md_html('<div class="cs-timeline-more-indicator">···</div>')
+
+    render_history_show_more_controls(
+        hidden_count=hidden_count,
+        total=total,
+        shown_count=shown_count,
+        session_key=visible_session_key,
+        show_more_key=button_key,
+    )
 
 
 def render_handover_visible_timelines(patient_id, period_key: str, tz_obj) -> None:
     all_symptom_events = load_symptom_timeline_events(patient_id=patient_id)
     symptom_events = filter_events_by_handover_period(all_symptom_events, period_key, tz_obj)
+
     md_html('<div class="cs-handover-timeline-divider"></div>')
     render_paginated_handover_timeline(
         symptom_events,
@@ -3224,6 +3440,8 @@ def render_first_time_guide_button() -> None:
 
 
 PROFILE_MANAGEMENT_HELP = """
+**Important:** Right now this is single-login, multi-profile — like a shared family account. In production we'd add per-caregiver authentication/permissions if this handled real medical data.
+
 **Who's logged in?** (left)
 
 - Pick your name from the dropdown if you're already set up.
@@ -3241,21 +3459,25 @@ You can switch carer or patient at any time — reports stay linked to the right
 
 
 RESPONSIBLE_AI_SAFETY_CONTENT = """
-CareShield is built with the understanding that it sits between a frightened or exhausted family member and decisions about someone they love. Every part of the product reflects that responsibility.
+CareShield sits between a frightened or exhausted family member and decisions about someone they love. I didn't take that lightly while building it.
 
-**Privacy by design.** Patient data, including medications, conditions, symptom reports, and uploaded photos, is stored per care circle and only accessible to the caregivers explicitly added to that patient's profile. Documents and photos are processed to extract structured data and are never used to train external models or shared with third parties.
+**Privacy, honestly.** My data model keeps each patient's medications, conditions, symptom reports, and photos scoped to their own profile, built around how care actually works — usually several family members looking after one person, not one account per patient. Right now, in this hackathon build, I've kept profile selection open and database policies loose on purpose, so I could spend my limited time getting the clinical reasoning right instead of also building full authentication. That was a conscious tradeoff, not something I missed. Row Level Security is already switched on at the database level, and the next real step is caregiver login and care-circle permissions — the schema is already built to support that without starting over. Documents and photos are only used to pull out structured medical data, nothing else. And anything sent to OpenAI for AI responses isn't used to train their models.
 
-**Decision support, not diagnosis.** CareShield never tells a caregiver what to do medically. Every AI response in Report & Ask is paired with a visible disclaimer, and the MedCam verification flow explicitly states "Review before giving" rather than issuing a pass or fail, because a photo of pills in a hand is never 100% certain. The product is designed to organize information and surface patterns, leaving every clinical judgment to the patient's actual doctor.
+**I built for the blank screen, not just the perfect demo.** A brand-new patient has no documents, no symptoms logged, no doses recorded yet — and I wanted the app to be honest about that instead of pretending otherwise. Handover tells you plainly there isn't enough logged yet to generate a report. Documents says "no medications on file" instead of just showing nothing. Pill Registration and MedCam both notice when there's nothing to check against and walk you toward uploading a document first. A system that quietly guesses when it has no data is worse than one that just says so.
 
-**Failure modes we designed for, not around.** A caregiver photographing pills will sometimes miss one in frame, photograph the wrong angle, or use poor lighting. Rather than guessing, MedCam reports exactly what it could and couldn't detect, for example "Only 1 of 2 pills detected, check you have the full dose," and flags medications missing from the photo as "missed but absent" instead of silently assuming they were taken. When confidence is low, the system says so directly: "Could not verify," rather than producing a false positive that gives a caregiver unearned confidence.
+**I tried to catch mistakes before they become real ones.** Upload a document for the wrong patient, and CareShield refuses it rather than silently mixing someone else's medical history into the wrong profile. If MedCam isn't confident about a pill in a photo, it says so and tells you to check it yourself instead of guessing. And if a scheduled dose is missing from the photo, it doesn't just log it as skipped — it tells you exactly what's at stake: "Amlodipine was due earlier today but was not in this photo. If you still need to give it, check the care plan for late doses — do not double up without checking with the doctor or pharmacist first." A wrong guess here isn't a bug, it's a real risk to a real person, so I tried to make sure uncertainty always gets handed back to a human.
 
-**Severity is surfaced, not buried.** Symptom reports are automatically scored as Monitor, Contact doctor, or Urgent, so a caregiver scanning a long history during a stressful moment sees what needs attention first, instead of having to read every entry to find the one that mattered.
+**This is support, not a diagnosis.** CareShield never tells you what to do medically. Every response comes with a clear disclaimer, and MedCam says "review before giving," never a pass or fail — because a photo of pills in someone's hand is never 100% certain. It's here to organize and notice patterns. The doctor still makes the calls.
 
-**Human oversight stays with the human.** Caregivers choose what gets reported, decide whether to act on a MedCam warning, and control what gets shared in the Handover report. CareShield never auto-contacts a doctor, auto-administers a reminder as confirmation of a dose given, or makes any decision on the caregiver's behalf. It compiles and organizes; the person remains the one who acts.
+**I'd rather admit uncertainty than fake confidence.** Photos get blurry, angles are wrong, lighting is bad — a caregiver doing this at 11pm, exhausted, will sometimes miss a pill in frame. So instead of guessing, MedCam tells you exactly what it saw and didn't: "Only 1 of 2 pills detected, check you have the full dose." If it's not sure, it says "could not verify" — because a false "all good" is more dangerous than admitting it doesn't know.
+
+**The important stuff doesn't get buried.** Every symptom report gets a severity label — Monitor, Contact doctor, or Urgent — so a caregiver skimming a long history in a stressful moment sees what actually needs attention first, instead of having to reread everything.
+
+**You're still the one in charge.** You decide what gets reported, whether to act on a MedCam warning, and what goes into the Handover report. CareShield never calls a doctor for you, never assumes a dose was given, never makes a decision on your behalf. It organizes. You act.
 """
 
 
-@st.dialog("Responsible AI and safety")
+@st.dialog("Responsible AI and Safety")
 def responsible_ai_safety_dialog() -> None:
     st.markdown(RESPONSIBLE_AI_SAFETY_CONTENT)
     if st.button("Close", use_container_width=True, key="close_responsible_ai_dialog"):
@@ -3463,21 +3685,13 @@ def format_caregiver_clinical_tags(tags) -> str:
 
 
 def reports_health_symptom_topic(text: str) -> bool:
-    """True when a message describes a symptom or health change worth cross-checking."""
-    cleaned = str(text or "").strip()
-    if not cleaned:
-        return False
-    if not is_question(cleaned):
-        return True
-    return bool(
-        re.search(
-            r"stiff|stiffness|pain|ache|swell|swollen|fever|temperature|confus|bruise|bleed|"
-            r"breath|cough|nausea|vomit|rash|wound|fall|dizzy|weak|tired|fatigue|limp|"
-            r"mobility|walking|knee|hip|joint|headache|chest|palpitat",
-            cleaned,
-            re.I,
-        )
-    )
+    from ai_helpers import reports_health_symptom_topic as _reports_health_symptom_topic
+    return _reports_health_symptom_topic(text)
+
+
+def is_question(text: str) -> bool:
+    from ai_helpers import is_care_question_text
+    return is_care_question_text(text)
 
 
 def append_care_guidance(reply: str, severity: str, needs_doctor: bool = False) -> str:
@@ -3489,17 +3703,6 @@ def append_care_guidance(reply: str, severity: str, needs_doctor: bool = False) 
     if is_contact_doctor_severity(level):
         return reply + f"\n\n{CONTACT_DOCTOR_GUIDANCE}"
     return reply
-
-
-def is_question(text: str) -> bool:
-    cleaned = text.strip().lower()
-    if cleaned.endswith("?"):
-        return True
-    question_starts = (
-        "what ", "when ", "where ", "who ", "why ", "how ",
-        "is ", "are ", "can ", "should ", "does ", "do ", "could ",
-    )
-    return cleaned.startswith(question_starts)
 
 
 def build_med_rows_html(items, demo_class=""):
@@ -3545,6 +3748,8 @@ def is_medication_schedule_question(text: str) -> bool:
     if not text or not text.strip():
         return False
     lower = text.lower()
+    if re.search(r"\bhow(?:'s| is| are| was| were)\b.+\bworking\b", lower):
+        return True
     keywords = (
         "pill", "pills", "medication", "medications", "medicine", "medicines",
         "dose", "doses", "tablet", "tablets", "give", "take", "schedule",
@@ -3659,132 +3864,47 @@ def _format_med_name_list(names: list[str], max_show: int = 4) -> str:
     return text
 
 
-def _summarize_missed_doses_today(missed: list) -> str:
-    if not missed:
-        return ""
-    if len(missed) == 1:
-        dose = missed[0]
-        friendly = format_friendly_dose_time(dose["hour"], dose["minute"])
-        return (
-            f"\n\nToday he may have missed **{dose['medication_name']}** at **{friendly}**. "
-            "Check the care plan or GP before giving a late dose."
-        )
-    slot_count = len({(dose["hour"], dose["minute"]) for dose in missed})
-    return (
-        f"\n\nToday he may have missed **{len(missed)} doses** across **{slot_count} time slots**. "
-        "Check the care plan or GP before giving any late doses — see **MedCam** for the full list."
-    )
-
-
-def _format_next_pill_when(occurrence: datetime, now: datetime, minutes: float) -> str:
-    friendly = format_friendly_dose_time(occurrence.hour, occurrence.minute)
-    relative = _format_relative_when(minutes)
-    if occurrence.date() > now.date():
-        return f"**{friendly}** tomorrow ({relative})"
-    return f"**{friendly}** ({relative})"
-
-
 def build_next_medication_reply(
     plan_items: list | None = None,
     patient_id=None,
+    user_text: str = "",
+    today_logs: list | None = None,
+    now: datetime | None = None,
 ) -> str:
     items = plan_items or get_active_plan_items()
-    if not items:
-        return (
-            "I don't see a medication plan on file yet. Upload a discharge document in the "
-            "**Documents** tab so I can tell you when the next dose is due."
-        )
-
     tz_obj, _ = get_schedule_tz()
-    now = datetime.now(tz_obj)
+    now = now or datetime.now(tz_obj)
     today = now.date().isoformat()
     resolved_patient_id = resolve_patient_id(
         patient_id if patient_id is not None else st.session_state.get("selected_patient_id")
     )
-    dose_events = build_dose_events(items)
-    if not dose_events:
-        return build_medication_schedule_reply(items)
 
-    today_logs = [
-        log for log in cached_medication_logs(resolved_patient_id)
-        if parse_log_local_date(log, tz_obj) == today
-    ]
-
-    actionable: list[dict] = []
-    missed_today: list[dict] = []
-    upcoming: list[dict] = []
-
-    for dose in dose_events:
-        state = dose_ui_state(dose, now, today_logs, tz_obj)
-        if state == "taken":
-            continue
-        entry = {**dose, "state": state}
-        if state == "actionable":
-            actionable.append(entry)
-        elif state == "missed":
-            missed_today.append(entry)
-        occurrence = _dose_next_occurrence(dose, now)
-        minutes_until = (occurrence - now).total_seconds() / 60
-        upcoming.append({
-            **entry,
-            "occurrence": occurrence,
-            "minutes_until": minutes_until,
-        })
-
-    missed_note = _summarize_missed_doses_today(missed_today)
-
-    if actionable:
-        slot = min(actionable, key=lambda item: (item["hour"], item["minute"], item["medication_name"]))
-        friendly = format_friendly_dose_time(slot["hour"], slot["minute"])
-        same_time = [
-            dose for dose in actionable
-            if dose["hour"] == slot["hour"] and dose["minute"] == slot["minute"]
+    if today_logs is None:
+        today_logs = [
+            log for log in cached_medication_logs(resolved_patient_id)
+            if parse_log_local_date(log, tz_obj) == today
         ]
-        names = [dose["medication_name"] for dose in sorted(
-            same_time,
-            key=lambda item: item["medication_name"],
-        )]
-        if len(names) == 1:
-            primary = (
-                f"His next pill is **{names[0]}** — due **now** (scheduled for **{friendly}**). "
-                "Use **MedCam** to verify and log it when given."
-            )
-        else:
-            primary = (
-                f"His next pills are due **now** at **{friendly}**: "
-                f"{_format_med_name_list(names)}. "
-                "Use **MedCam** to verify and log them when given."
-            )
-        return primary + missed_note
 
-    if not upcoming:
-        first = dose_events[0]
-        friendly = format_friendly_dose_time(first["hour"], first["minute"])
-        return (
-            f"All scheduled doses for today look complete. "
-            f"His next pill on the plan is **{first['medication_name']}** at **{friendly}** "
-            f"on the next scheduled day.\n\n"
-            f"Open **MedCam** to log doses when you give them."
+    named_med = extract_medication_name_from_question(user_text, items)
+    patient_label = get_patient_display_name(resolved_patient_id)
+    unknown_med = None
+    if named_med:
+        unknown_med = (
+            f"I don't see **{named_med}** on {patient_label}'s medication plan. "
+            "Open **Documents** to confirm their medicines, or ask about a drug on the plan."
         )
 
-    next_slot = min(upcoming, key=lambda item: item["minutes_until"])
-    same_time = [
-        dose for dose in upcoming
-        if dose["occurrence"] == next_slot["occurrence"]
-    ]
-    names = [dose["medication_name"] for dose in sorted(
-        same_time,
-        key=lambda item: item["medication_name"],
-    )]
-    when_part = _format_next_pill_when(next_slot["occurrence"], now, next_slot["minutes_until"])
-
-    if len(names) == 1:
-        primary = f"His next pill is **{names[0]}** at {when_part}."
-    else:
-        primary = f"His next pills at {when_part} are: {_format_med_name_list(names)}."
-
-    primary += " Use **MedCam** to verify and log when given."
-    return primary + missed_note
+    reply = build_next_medication_reply_core(
+        items,
+        user_text=user_text,
+        today_logs=today_logs,
+        now=now,
+        tz_obj=tz_obj,
+        unknown_med_message=unknown_med,
+    )
+    if reply.startswith("No scheduled dose times"):
+        return build_medication_schedule_reply(items)
+    return reply
 
 
 def find_plan_item(med_name: str, plan_items: list) -> dict:
@@ -5051,8 +5171,11 @@ def pill_registration_dialog():
             )
 
     if remove_clicked and ref:
-        delete_medication_reference(ref["id"], st.session_state.selected_patient_id)
+        removed_patient_id = st.session_state.selected_patient_id
+        delete_medication_reference(ref["id"], removed_patient_id)
         st.session_state.pop("pill_modal", None)
+        st.session_state.pop(f"medication_refs_{resolve_patient_id(removed_patient_id)}", None)
+        invalidate_patient_activity_cache(removed_patient_id)
         st.success(f"Removed {med_name}.")
         st.rerun()
 
@@ -5077,7 +5200,7 @@ def pill_registration_dialog():
             st.warning("Please upload both a front and a back photo before saving.")
         elif is_update and ref:
             with st.spinner("Updating reference..."):
-                update_medication_reference(
+                saved = update_medication_reference(
                     ref_id=ref["id"],
                     image_b64=front_b64,
                     pill_strength=strength,
@@ -5085,16 +5208,20 @@ def pill_registration_dialog():
                     brand=brand,
                     pills_per_dose=pills_per_dose,
                     back_image_b64=back_b64,
+                    patient_id=patient_id,
                 )
-            st.session_state.pop("pill_modal", None)
-            st.session_state.pop(f"medcam_last_{resolve_patient_id(patient_id)}", None)
-            st.session_state.pop(f"medication_refs_{resolve_patient_id(patient_id)}", None)
-            invalidate_patient_activity_cache(patient_id)
-            st.success(f"Updated {med_name}.")
-            st.rerun()
+            if not saved:
+                st.error(f"Could not update {med_name}. Please try again.")
+            else:
+                st.session_state.pop("pill_modal", None)
+                st.session_state.pop(f"medication_refs_{resolve_patient_id(patient_id)}", None)
+                st.session_state.pop(f"medcam_last_{resolve_patient_id(patient_id)}", None)
+                invalidate_patient_activity_cache(patient_id)
+                st.success(f"Updated {med_name}.")
+                st.rerun()
         else:
             with st.spinner("Saving reference..."):
-                upsert_medication_reference(
+                saved = upsert_medication_reference(
                     medication_name=med_name,
                     image_b64=front_b64,
                     pill_strength=strength,
@@ -5104,12 +5231,15 @@ def pill_registration_dialog():
                     patient_id=patient_id,
                     back_image_b64=back_b64,
                 )
-            st.session_state.pop("pill_modal", None)
-            st.session_state.pop(f"medcam_last_{resolve_patient_id(patient_id)}", None)
-            st.session_state.pop(f"medication_refs_{resolve_patient_id(patient_id)}", None)
-            invalidate_patient_activity_cache(patient_id)
-            st.success(f"{med_name} registered.")
-            st.rerun()
+            if not saved:
+                st.error(f"Could not save {med_name}. Please try again.")
+            else:
+                st.session_state.pop("pill_modal", None)
+                st.session_state.pop(f"medication_refs_{resolve_patient_id(patient_id)}", None)
+                st.session_state.pop(f"medcam_last_{resolve_patient_id(patient_id)}", None)
+                invalidate_patient_activity_cache(patient_id)
+                st.success(f"{med_name} registered.")
+                st.rerun()
 
 
 def build_plan_rows_html(items):
@@ -5130,8 +5260,48 @@ def build_plan_rows_html(items):
     return "".join(rows)
 
 
+def finalize_chat_patient_facing_text(
+    text: str,
+    *,
+    patient_id=None,
+    user_text: str = "",
+) -> str:
+    return enforce_active_patient_name_in_text(
+        coerce_ai_text(text),
+        get_patient_display_name(patient_id),
+        user_text,
+    )
+
+
+def finalize_condition_risk_alerts(
+    alerts: list | None,
+    *,
+    patient_id=None,
+    user_text: str = "",
+) -> list:
+    from ai_helpers import retailor_education_messages_to_symptom
+
+    active_name = get_patient_display_name(patient_id)
+    tailored = retailor_education_messages_to_symptom(
+        user_text,
+        alerts or [],
+        active_name,
+    )
+    finalized = []
+    for item in tailored:
+        row = dict(item)
+        row["education_message"] = enforce_active_patient_name_in_text(
+            str(row.get("education_message") or ""),
+            active_name,
+            user_text,
+        )
+        finalized.append(row)
+    return finalized
+
+
 def build_patient_context_block(patient_id=None):
     patient_id = resolve_patient_id(patient_id or st.session_state.get("selected_patient_id"))
+    active_patient_name = get_patient_display_name(patient_id)
     raw_meds = get_patient_medications_display(patient_id)
 
     med_lines = []
@@ -5152,8 +5322,10 @@ def build_patient_context_block(patient_id=None):
     cond_lines = []
     for condition in conditions:
         _, status_label = condition_badge_meta(condition.get("badge", "chronic"))
+        onset = normalize_condition_since(condition.get("since"))
+        onset_part = f"; onset {onset}" if onset else ""
         cond_lines.append(
-            f"- {condition['name']} ({status_label}); onset {condition.get('since', 'Unknown')}"
+            f"- {condition['name']} ({status_label}){onset_part}"
         )
 
     allergy_lines = [f"- {item}" for item in get_patient_allergy_notes(patient_id)]
@@ -5178,6 +5350,8 @@ def build_patient_context_block(patient_id=None):
     document_section = "\n".join(document_lines) if document_lines else "- No uploaded document excerpts on file"
 
     return f"""THIS IS A SINGLE-PATIENT FAMILY ACCOUNT — the patient below is always on file for this CareShield home.
+
+ACTIVE PATIENT NAME (always use this exact name in responses — ignore any other name the caregiver types): {active_patient_name}
 
 PATIENT STORED MEDICATIONS — always use this list for dosing, timing, and drug-specific advice:
 {meds_section}
@@ -5448,6 +5622,14 @@ def process_chat_photo_response(
 ) -> bool:
     from ai_helpers import ask_ai, get_medication_references
 
+    patient_id = st.session_state.get("selected_patient_id")
+    _report_ask_logger.info(
+        "Report & Ask photo context patient=%s session_prior_count=%d user_preview=%r",
+        patient_id,
+        len(prior_incidents),
+        (user_text or "")[:120],
+    )
+
     med_refs = cached_medication_references(st.session_state.selected_patient_id)
     plan_items = get_active_plan_items()
     user_content = build_chat_photo_ai_content(
@@ -5524,10 +5706,14 @@ def process_chat_photo_response(
             photo_finding = "normal"
         else:
             symptom_context = user_text or reply
+            symptom_context_medications = get_patient_medications_for_symptom_context(
+                st.session_state.get("selected_patient_id")
+            )
             condition_analysis = analyze_symptom_against_conditions(
                 symptom_context,
                 patient_id=st.session_state.get("selected_patient_id"),
-                medications=get_patient_medications_display(),
+                medications=symptom_context_medications,
+                allergies=get_patient_allergy_notes(st.session_state.get("selected_patient_id")),
             )
             severity, session_triggers = resolve_chat_severity(
                 result.get("risk_level", "monitor"),
@@ -5547,8 +5733,21 @@ def process_chat_photo_response(
                 needs_doctor=needs_doctor_flag,
                 prior_incidents=prior_incidents,
             )
+            severity = cap_allergy_report_severity(symptom_context, severity)
+            severity = apply_report_severity_floor_caps(
+                symptom_context,
+                severity,
+                medications=symptom_context_medications,
+                conditions=get_patient_conditions(st.session_state.get("selected_patient_id")),
+            )
+            severity = cap_positive_report_severity(symptom_context, severity)
             photo_finding = clinical_finding or "concern"
-        reply += build_session_connection_note(prior_incidents, session_triggers)
+        reply += build_session_connection_note(
+            prior_incidents,
+            session_triggers,
+            current_text=(user_text or reply) if photo_finding != "normal" else "",
+            patient_id=st.session_state.get("selected_patient_id"),
+        )
         if severity != "ok":
             reply = append_care_guidance(reply, severity)
         reply += SESSION_HANDOVER_NOTE
@@ -5565,6 +5764,25 @@ def process_chat_photo_response(
             user_text or reply,
             session_triggers,
         )
+        reply, session_triggers, context_report_count = enforce_report_ask_session_evidence(
+            reply,
+            prior_incidents=prior_incidents,
+            session_triggers=session_triggers,
+            context_report_count=context_report_count,
+            patient_id=st.session_state.get("selected_patient_id"),
+        )
+
+    patient_id = st.session_state.get("selected_patient_id")
+    reply = finalize_chat_patient_facing_text(
+        reply,
+        patient_id=patient_id,
+        user_text=user_text or incident_text,
+    )
+    condition_risk_alerts = finalize_condition_risk_alerts(
+        condition_risk_alerts,
+        patient_id=patient_id,
+        user_text=user_text or incident_text,
+    )
 
     record_session_incident(
         text=incident_text,
@@ -5601,27 +5819,77 @@ def process_pending_chat_response(caregiver_label: str, current_time_str: str) -
     pending = st.session_state.pending_chat_response
     caregiver_id = resolve_caregiver_id(caregiver_label)
     patient_id = get_current_patient_id()
-    prior_incidents = get_session_incidents()
+    prior_incidents = get_session_incidents(patient_id)
     context = build_patient_context_block(patient_id)
-    session_context = build_session_reports_context()
+    session_context = build_session_reports_context(patient_id)
     timeline_context = build_patient_report_timeline_context(patient_id, prior_incidents)
+    stored_chat_context = build_stored_chat_context_for_ai(patient_id)
+    stored_chat_block = f"\n{stored_chat_context}\n" if stored_chat_context else ""
     user_text = pending.get("text", "").strip()
+    _report_ask_logger.info(
+        "Report & Ask context patient=%s session_prior_count=%d stored_reports=%d stored_chat_chars=%d user_preview=%r",
+        patient_id,
+        len(prior_incidents),
+        len(fetch_patient_care_reports(patient_id, limit=500)),
+        len(stored_chat_context or ""),
+        user_text[:120],
+    )
+    if prior_incidents:
+        _report_ask_logger.debug(
+            "Session priors for patient=%s: %s",
+            patient_id,
+            [
+                {
+                    "time": item.get("timestamp_display"),
+                    "text": str(item.get("text") or "")[:120],
+                    "severity": item.get("severity"),
+                }
+                for item in prior_incidents[-5:]
+            ],
+        )
+    _report_ask_logger.debug(
+        "Timeline context preview for patient=%s: %s",
+        patient_id,
+        timeline_context[:500],
+    )
+    _report_ask_logger.debug(
+        "Session context for patient=%s: %s",
+        patient_id,
+        session_context[:500],
+    )
     reported_at = pending.get("reported_at") or datetime.now(timezone.utc).isoformat()
     timestamp_display = pending.get("timestamp_display") or format_chat_timestamp(reported_at)
     from ai_helpers import get_relevant_medical_context
-    medical_context = get_relevant_medical_context(user_text) if user_text else ""
+    medical_context = ""
+    if user_text and not extract_unverified_patient_claims(user_text, patient_id):
+        medical_context = get_relevant_medical_context(user_text)
     image_b64 = pending.get("image_b64")
     chat_history = build_chat_history_for_api(st.session_state.messages)
     condition_analysis = None
     personalization_block = ""
+    allergy_notes = get_patient_allergy_notes(patient_id)
+    symptom_context_medications = get_patient_medications_for_symptom_context(patient_id)
+    symptom_context_conditions = get_patient_conditions(patient_id)
+    allergy_prompt_block = build_allergy_symptom_prompt_block(user_text, allergy_notes)
+
+    claim_grounding_block = ""
+    if user_text and is_question(user_text):
+        claim_grounding_block = build_patient_claim_grounding_prompt_block(user_text, patient_id)
+        if claim_grounding_block:
+            claim_grounding_block = f"\n\n{claim_grounding_block}"
 
     if user_text and reports_health_symptom_topic(user_text):
         condition_analysis = analyze_symptom_against_conditions(
             user_text,
             patient_id=patient_id,
-            medications=get_patient_medications_display(patient_id),
+            medications=symptom_context_medications,
+            allergies=allergy_notes,
         )
         personalization_block = build_condition_analysis_prompt_block(condition_analysis)
+        if allergy_prompt_block and allergy_prompt_block not in personalization_block:
+            personalization_block = f"{personalization_block}\n\n{allergy_prompt_block}".strip()
+    elif allergy_prompt_block:
+        personalization_block = allergy_prompt_block
 
     if image_b64:
         return process_chat_photo_response(
@@ -5641,7 +5909,11 @@ def process_pending_chat_response(caregiver_label: str, current_time_str: str) -
     if is_question(user_text):
         plan_items = get_active_plan_items()
         if is_next_medication_question(user_text):
-            reply = build_next_medication_reply(plan_items)
+            reply = build_next_medication_reply(
+                plan_items,
+                patient_id=patient_id,
+                user_text=user_text,
+            )
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": reply,
@@ -5671,13 +5943,14 @@ Reference their actual drugs, schedules, diagnoses, and recent reports when rele
 
 {CHAT_SINGLE_PATIENT_RULES}
 {CHAT_SYMPTOM_PERSONALIZATION_RULES}
+{CHAT_INFORMATIONAL_QUESTION_RULES}
 {context}
 {med_schedule_block}
 
 {timeline_context}
 
 {session_context}
-{personalization_block}
+{stored_chat_block}{personalization_block}{claim_grounding_block}
 {("RELEVANT MEDICAL KNOWLEDGE:\n" + medical_context) if medical_context else ""}
 Current date/time: {current_time_str}
 Answer clearly and reassuringly. For medication timing questions, list each drug with its scheduled time from the plan.
@@ -5703,7 +5976,7 @@ Flag risks that relate to their specific drugs and diagnoses. When a symptom is 
 {timeline_context}
 
 {session_context}
-{personalization_block}
+{stored_chat_block}{personalization_block}
 {("RELEVANT MEDICAL KNOWLEDGE:\n" + medical_context) if medical_context else ""}
 Current date/time: {current_time_str}
 Respond with ONLY a JSON object with:
@@ -5744,6 +6017,7 @@ Respond with ONLY a JSON object with:
 
     if is_question(user_text):
         reply = coerce_ai_text(result.get("answer") or result.get("analysis"))
+        reply = enforce_patient_record_grounding_in_reply(reply, user_text, patient_id)
         plan_items = get_active_plan_items()
         if is_medication_schedule_question(user_text) and looks_like_medication_refusal(reply):
             reply = build_medication_schedule_reply(plan_items)
@@ -5770,11 +6044,38 @@ Respond with ONLY a JSON object with:
                 needs_doctor=needs_doctor_flag,
                 prior_incidents=prior_incidents,
             )
-        reply += build_session_connection_note(prior_incidents, session_triggers)
+        severity = cap_allergy_report_severity(user_text, severity)
+        severity = apply_report_severity_floor_caps(
+            user_text,
+            severity,
+            medications=symptom_context_medications,
+            conditions=symptom_context_conditions,
+        )
+        severity = cap_positive_report_severity(user_text, severity)
+        severity = cap_informational_question_severity(user_text, severity)
+        reply += build_session_connection_note(
+            prior_incidents,
+            session_triggers,
+            current_text=user_text,
+            patient_id=patient_id,
+        )
         reply = append_care_guidance(reply, severity)
         if not reply.strip():
             reply = "I couldn't generate an answer just now. Please try again."
         context_report_count = count_linked_reports(prior_incidents, user_text, session_triggers)
+        reply, session_triggers, context_report_count = enforce_report_ask_session_evidence(
+            reply,
+            prior_incidents=prior_incidents,
+            session_triggers=session_triggers,
+            context_report_count=context_report_count,
+            patient_id=patient_id,
+        )
+        reply = finalize_chat_patient_facing_text(reply, patient_id=patient_id, user_text=user_text)
+        condition_risk_alerts = finalize_condition_risk_alerts(
+            condition_risk_alerts,
+            patient_id=patient_id,
+            user_text=user_text,
+        )
         message = {
             "role": "assistant",
             "content": reply,
@@ -5823,12 +6124,38 @@ Respond with ONLY a JSON object with:
                 needs_doctor=needs_doctor_flag,
                 prior_incidents=prior_incidents,
             )
-        reply += build_session_connection_note(prior_incidents, session_triggers)
+        severity = cap_allergy_report_severity(user_text, severity)
+        severity = apply_report_severity_floor_caps(
+            user_text,
+            severity,
+            medications=symptom_context_medications,
+            conditions=symptom_context_conditions,
+        )
+        severity = cap_positive_report_severity(user_text, severity)
+        reply += build_session_connection_note(
+            prior_incidents,
+            session_triggers,
+            current_text=user_text,
+            patient_id=patient_id,
+        )
         reply = append_care_guidance(reply, severity)
         reply += SESSION_HANDOVER_NOTE
         if not reply.strip():
             reply = "I couldn't generate a response just now. Please try again."
         context_report_count = count_linked_reports(prior_incidents, user_text, session_triggers)
+        reply, session_triggers, context_report_count = enforce_report_ask_session_evidence(
+            reply,
+            prior_incidents=prior_incidents,
+            session_triggers=session_triggers,
+            context_report_count=context_report_count,
+            patient_id=patient_id,
+        )
+        reply = finalize_chat_patient_facing_text(reply, patient_id=patient_id, user_text=user_text)
+        condition_risk_alerts = finalize_condition_risk_alerts(
+            condition_risk_alerts,
+            patient_id=patient_id,
+            user_text=user_text,
+        )
         doctor_note = result.get("doctor_note", user_text)
         record_session_incident(
             text=user_text,
@@ -5853,8 +6180,24 @@ Respond with ONLY a JSON object with:
         st.session_state.messages.append(assistant_message)
         st.session_state.chat_scroll_to_bottom = True
 
+    last_msg = (st.session_state.messages or [])[-1] if st.session_state.get("messages") else {}
+    if last_msg.get("role") == "assistant":
+        _report_ask_logger.info(
+            "Report & Ask outcome patient=%s severity=%s linked_count=%s",
+            patient_id,
+            last_msg.get("severity", "ok"),
+            last_msg.get("context_report_count", 1),
+        )
+
     persist_patient_chat_thread(patient_id)
     return True
+
+def build_condition_since_html(since) -> str:
+    label = normalize_condition_since(since)
+    if not label:
+        return ""
+    return f'<div class="cs-condition-date">{html.escape(label)}</div>'
+
 
 def build_condition_rows_html(conditions):
     rows = []
@@ -5863,7 +6206,7 @@ def build_condition_rows_html(conditions):
         rows.append(
             f'<div class="cs-condition-row">'
             f'<div><div class="cs-condition-name">{item["name"]}</div>'
-            f'<div class="cs-condition-date">{item["since"]}</div></div>'
+            f'{build_condition_since_html(item.get("since"))}</div>'
             f'<span class="cs-badge {badge_class}">{badge_label}</span></div>'
         )
     return "".join(rows)
@@ -6037,10 +6380,39 @@ def dose_log_key(medication_name: str, time_label: str, date_iso: str) -> str:
 
 
 def init_caregiver_profiles() -> None:
-    if "caregiver_profiles" not in st.session_state:
-        st.session_state.caregiver_profiles = [dict(profile) for profile in DEFAULT_CAREGIVER_PROFILES]
-    if "selected_caregiver_id" not in st.session_state:
-        st.session_state.selected_caregiver_id = DEFAULT_CAREGIVER_PROFILES[0]["id"]
+    if "caregiver_profiles" in st.session_state:
+        return
+
+    from patient_care_storage import load_saved_caregiver_profiles
+
+    saved = load_saved_caregiver_profiles()
+    if saved and saved.get("profiles"):
+        st.session_state.caregiver_profiles = [dict(profile) for profile in saved["profiles"]]
+        active_profiles = [
+            profile for profile in st.session_state.caregiver_profiles
+            if not profile.get("is_deleted")
+        ]
+        selected_id = str(saved.get("selected_caregiver_id") or "").strip()
+        if selected_id and any(profile.get("id") == selected_id for profile in active_profiles):
+            st.session_state.selected_caregiver_id = selected_id
+        elif active_profiles:
+            st.session_state.selected_caregiver_id = active_profiles[0]["id"]
+        else:
+            st.session_state.selected_caregiver_id = st.session_state.caregiver_profiles[0]["id"]
+        return
+
+    st.session_state.caregiver_profiles = [dict(profile) for profile in DEFAULT_CAREGIVER_PROFILES]
+    st.session_state.selected_caregiver_id = DEFAULT_CAREGIVER_PROFILES[0]["id"]
+
+
+def persist_caregiver_profiles_to_disk() -> None:
+    from patient_care_storage import save_caregiver_profiles
+
+    init_caregiver_profiles()
+    save_caregiver_profiles(
+        st.session_state.caregiver_profiles,
+        st.session_state.selected_caregiver_id,
+    )
 
 
 def get_all_caregiver_profiles() -> list[dict]:
@@ -6126,8 +6498,16 @@ def add_caregiver_profile(name: str, role: str) -> dict | None:
     }
     profiles.append(profile)
     st.session_state.caregiver_profiles = profiles
+    previous_caregiver_id = st.session_state.get("selected_caregiver_id")
+    reset_report_ask_for_caregiver_switch(
+        str(st.session_state.get("selected_patient_id") or ""),
+        format_caregiver_label(profile),
+        profile["id"],
+        previous_caregiver_id=previous_caregiver_id,
+    )
     st.session_state.selected_caregiver_id = profile["id"]
     st.session_state.pop("caregiver_profile_picker", None)
+    persist_caregiver_profiles_to_disk()
     return profile
 
 
@@ -6145,6 +6525,7 @@ def update_caregiver_profile(profile_id: str, name: str, role: str) -> bool:
             st.session_state.caregiver_profiles = profiles
             if st.session_state.get("chat_caregiver_id") == profile_id:
                 st.session_state.chat_caregiver = format_caregiver_label(profile)
+            persist_caregiver_profiles_to_disk()
             return True
     return False
 
@@ -6167,10 +6548,14 @@ def delete_caregiver_profile(profile_id: str) -> tuple[bool, str | None]:
     remaining_active = get_caregiver_profiles()
     if st.session_state.selected_caregiver_id == profile_id:
         st.session_state.selected_caregiver_id = remaining_active[0]["id"]
-        if st.session_state.get("chat_caregiver_id") == profile_id:
-            st.session_state.chat_caregiver_id = remaining_active[0]["id"]
-            st.session_state.chat_caregiver = format_caregiver_label(remaining_active[0])
+        reset_report_ask_for_caregiver_switch(
+            str(st.session_state.get("selected_patient_id") or ""),
+            format_caregiver_label(remaining_active[0]),
+            remaining_active[0]["id"],
+            previous_caregiver_id=profile_id,
+        )
     st.session_state.pop("caregiver_profile_picker", None)
+    persist_caregiver_profiles_to_disk()
     return True, None
 
 
@@ -6303,9 +6688,16 @@ def render_caregiver_profile_switcher() -> tuple[str, str]:
     labels = [format_caregiver_label(profile) for profile in profiles]
     current_label = get_caregiver_profile_label(selected_id)
     if current_label not in labels and labels:
+        previous_caregiver_id = selected_id
         current_label = labels[0]
         st.session_state.selected_caregiver_id = profiles[0]["id"]
         selected_id = profiles[0]["id"]
+        reset_report_ask_for_caregiver_switch(
+            str(st.session_state.get("selected_patient_id") or ""),
+            format_caregiver_label(profiles[0]),
+            profiles[0]["id"],
+            previous_caregiver_id=previous_caregiver_id,
+        )
 
     md_html(f"""
     <div class="cs-user-area cs-user-area-left">
@@ -6335,7 +6727,15 @@ def render_caregiver_profile_switcher() -> tuple[str, str]:
     elif picked in labels:
         profile = get_caregiver_profile_by_label(picked)
         if profile and profile["id"] != selected_id:
+            reset_report_ask_for_caregiver_switch(
+                str(st.session_state.get("selected_patient_id") or ""),
+                format_caregiver_label(profile),
+                profile["id"],
+                previous_caregiver_id=selected_id,
+            )
             st.session_state.selected_caregiver_id = profile["id"]
+            persist_caregiver_profiles_to_disk()
+            st.session_state.pop("caregiver_profile_picker", None)
             st.rerun()
 
     if st.session_state.pop("open_add_profile_dialog", False):
@@ -6643,14 +7043,6 @@ def enrich_medcam_pill_results(
     return enriched
 
 
-MEDCAM_ROW_CHEVRON_SVG = (
-    '<svg class="cs-medcam-pill-row-chevron" width="16" height="16" viewBox="0 0 24 24" '
-    'fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" '
-    'stroke-linejoin="round" aria-hidden="true">'
-    '<polyline points="6 9 12 15 18 9"/></svg>'
-)
-
-
 def get_medcam_pill_row_display(pill: dict) -> dict:
     med = (pill.get("medication_name") or "").strip() or None
     confidence = str(pill.get("match_confidence") or "none").lower()
@@ -6852,24 +7244,23 @@ def build_plan_absence_warnings(
     return warnings
 
 
-def build_medcam_row_html_from_display(row: dict, row_key: str) -> str:
-    return f"""
-    <details class="cs-medcam-pill-row cs-medcam-pill-row--{html.escape(row['role'])}">
-      <summary class="cs-medcam-pill-row-summary">
-        <div class="cs-medcam-pill-row-main">
-          <div class="cs-medcam-pill-row-label">{html.escape(row['label'])}</div>
-          <div class="cs-medcam-pill-row-verdict">{html.escape(row['verdict'])}</div>
-        </div>
-        {MEDCAM_ROW_CHEVRON_SVG}
-      </summary>
-      <div class="cs-medcam-pill-row-detail">{html.escape(row['detail'])}</div>
-    </details>
-    """
-
-
-def build_medcam_pill_row_html(pill: dict, index: int) -> str:
+def build_medcam_pill_row_html(
+    pill: dict,
+    index: int,
+    med_refs: list | None = None,
+) -> str:
     row = get_medcam_pill_row_display(pill)
-    return build_medcam_row_html_from_display(row, f"pill_{index}")
+    med = (pill.get("medication_name") or "").strip()
+    confidence = str(pill.get("match_confidence") or "none").lower()
+    identified = bool(med and confidence in MEDCAM_IDENTIFIED_CONFIDENCE)
+    thumb_html = ""
+    if identified:
+        thumb_html = build_medcam_reference_thumb_html(
+            med,
+            med_refs,
+            find_reference=find_medication_reference,
+        )
+    return build_medcam_row_html_from_display(row, thumb_html=thumb_html)
 
 
 def save_medcam_audit_record(
@@ -6959,6 +7350,7 @@ def build_medcam_verdict_panel_html(
     log_time: str,
     ai_result: dict | None = None,
     absence_warnings: list | None = None,
+    med_refs: list | None = None,
 ) -> str:
     title = html.escape(str(verdict.get("title", "Review")))
     time_label = html.escape(str(log_time))
@@ -6966,7 +7358,7 @@ def build_medcam_verdict_panel_html(
 
     if enriched_pills:
         rows_html = "".join(
-            build_medcam_pill_row_html(pill, index)
+            build_medcam_pill_row_html(pill, index, med_refs)
             for index, pill in enumerate(enriched_pills)
         )
     else:
@@ -6985,11 +7377,11 @@ def build_medcam_verdict_panel_html(
             "verdict": "Check manually",
             "role": "neutral",
             "detail": detail,
-        }, "empty")
+        })
 
     for idx, warning in enumerate(absence_warnings or []):
         row = build_medcam_absence_warning_row(warning)
-        rows_html += build_medcam_row_html_from_display(row, f"absence_{idx}")
+        rows_html += build_medcam_row_html_from_display(row)
 
     return f"""
     <div class="cs-medcam-verdict-panel cs-medcam-verdict-panel--{result_class}">
@@ -8001,7 +8393,7 @@ Respond with ONLY a JSON object with:
 4. "conditions": a JSON array of condition objects — one object per diagnosis or medical condition. NEVER combine multiple conditions into a single entry. If the document lists several conditions together in one phrase, split them into separate objects. Each object must include:
    - "name": the single condition name only (e.g. "Hypertension", not "Hypertension and diabetes")
    - "status": exactly one of "Chronic", "Recovery", or "Acute"
-   - "onset_date": when it started or was diagnosed (e.g. "2019", "March 2026", "Since 2021"); use "Unknown" if not stated
+   - "onset_date": when it started or was diagnosed (e.g. "2019", "March 2026", "Since 2021"); use null if not stated
 
 Rules:
 - If a medicine is being stopped, put it ONLY in discontinued_medications, never in medications.
@@ -8208,12 +8600,26 @@ def get_handover_pdf_bytes(
     result: dict,
 ) -> bytes:
     patient_id = resolve_patient_id(patient_id)
+    symptom_events_for_pdf = filter_events_by_handover_period(
+        load_symptom_timeline_events(patient_id=patient_id),
+        period_key,
+        tz_obj,
+    )
+    adherence_events_for_pdf = filter_events_by_handover_period(
+        load_medication_adherence_timeline_events(patient_id),
+        period_key,
+        tz_obj,
+    )
+    photo_reviews_for_pdf = get_handover_photo_reviews_for_period(patient_id, period_key, tz_obj)
     signature = hashlib.md5(
         json.dumps(
             {
                 "patient_id": patient_id,
                 "period": period_key,
                 "result": result,
+                "symptom_events": handover_events_signature(symptom_events_for_pdf),
+                "adherence_events": handover_events_signature(adherence_events_for_pdf),
+                "photo_count": len(photo_reviews_for_pdf),
             },
             sort_keys=True,
             default=str,
@@ -8221,21 +8627,17 @@ def get_handover_pdf_bytes(
     ).hexdigest()[:16]
     cache_key = f"handover_pdf_{signature}"
     if cache_key not in st.session_state:
-        symptom_events_for_pdf = filter_events_by_handover_period(
-            load_symptom_timeline_events(patient_id=patient_id),
-            period_key,
-            tz_obj,
-        )
         connected_links_for_pdf = build_connected_report_links(
             filter_session_incidents_by_period(period_key, tz_obj, patient_id=patient_id)
         )
-        photo_reviews_for_pdf = get_session_photo_reviews_for_handover(period_key, tz_obj)
         st.session_state[cache_key] = generate_handover_pdf(
             symptom_events_for_pdf,
             connected_links_for_pdf,
             result,
             photo_reviews=photo_reviews_for_pdf,
+            adherence_events=adherence_events_for_pdf,
             patient_label=get_patient_display_name(patient_id),
+            period_label=get_handover_period_label(period_key),
         )
     return st.session_state[cache_key]
 
@@ -8781,6 +9183,85 @@ def merge_pending_handover_questions(patient_id, sbar_result: dict) -> dict:
     return merged
 
 
+def _finalize_my_results_record(
+    record: dict,
+    *,
+    patient_id,
+    file_name: str,
+    raw_text: str,
+    caregiver_name: str,
+    caregiver_id=None,
+) -> dict:
+    doc_meta = {}
+    try:
+        doc_meta = save_patient_test_document(
+            patient_id,
+            file_name=file_name,
+            raw_text=raw_text,
+            caregiver_id=caregiver_id,
+        )
+    except Exception:
+        _my_results_logger.exception("Failed to save My Results document copy")
+
+    record = {
+        **record,
+        "file_name": file_name,
+        "document_id": doc_meta.get("document_id"),
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "patient_id": str(resolve_patient_id(patient_id) or ""),
+    }
+    record = enrich_my_results_record(record) or record
+    try:
+        save_my_result_record(
+            patient_id,
+            record,
+            caregiver_name,
+            caregiver_id=caregiver_id,
+        )
+    except Exception:
+        _my_results_logger.exception("Failed to persist My Results analysis to shift log")
+    return record
+
+
+def _try_my_results_offline_fallback(
+    raw_text: str,
+    *,
+    file_name: str,
+    patient_id,
+    patient_name: str,
+    conditions: list,
+    caregiver_name: str,
+    caregiver_id=None,
+) -> dict | None:
+    if not str(raw_text or "").strip():
+        return None
+    condition_names = [
+        str(item.get("name") or "").strip()
+        for item in (conditions or [])
+        if str(item.get("name") or "").strip()
+    ]
+    offline_record = build_my_results_record_from_offline_text(
+        raw_text,
+        file_name=file_name,
+        patient_name=patient_name,
+        known_conditions=condition_names,
+    )
+    if not offline_record:
+        return None
+    _my_results_logger.warning(
+        "My Results using offline text fallback for %s after AI service failure",
+        file_name,
+    )
+    return _finalize_my_results_record(
+        offline_record,
+        patient_id=patient_id,
+        file_name=file_name,
+        raw_text=raw_text,
+        caregiver_name=caregiver_name,
+        caregiver_id=caregiver_id,
+    )
+
+
 def process_my_results_upload(
     uploaded_file,
     patient_id,
@@ -8859,6 +9340,19 @@ def process_my_results_upload(
             "Extract AI returned error: stage=ai_extract details=%s",
             extract_raw.get("details") or extract_raw.get("message"),
         )
+        failure_reason = resolve_ai_failure_reason(extract_raw)
+        if ai_failure_is_recoverable_offline(failure_reason) and raw_text:
+            offline_record = _try_my_results_offline_fallback(
+                raw_text,
+                file_name=file_name,
+                patient_id=patient_id,
+                patient_name=patient_name,
+                conditions=conditions,
+                caregiver_name=caregiver_name,
+                caregiver_id=caregiver_id,
+            )
+            if offline_record:
+                return offline_record
         if extract_raw.get("reason") == "unreadable" or extract_raw.get("readability") == "unreadable":
             return {
                 "error": True,
@@ -8923,6 +9417,19 @@ def process_my_results_upload(
             "Explain AI returned error: details=%s",
             explain_raw.get("details") or explain_raw.get("message"),
         )
+        failure_reason = resolve_ai_failure_reason(explain_raw)
+        if ai_failure_is_recoverable_offline(failure_reason) and raw_text:
+            offline_record = _try_my_results_offline_fallback(
+                raw_text,
+                file_name=file_name,
+                patient_id=patient_id,
+                patient_name=patient_name,
+                conditions=conditions,
+                caregiver_name=caregiver_name,
+                caregiver_id=caregiver_id,
+            )
+            if offline_record:
+                return offline_record
         return {**explain_raw, "stage": "ai_explain"}
 
     explain = normalize_my_results_explain(
@@ -8943,36 +9450,14 @@ def process_my_results_upload(
             "message": "We couldn't generate an explanation right now. Please try again.",
         }
 
-    doc_meta = {}
-    try:
-        doc_meta = save_patient_test_document(
-            patient_id,
-            file_name=file_name,
-            raw_text=raw_text,
-            caregiver_id=caregiver_id,
-        )
-    except Exception:
-        _my_results_logger.exception("Failed to save My Results document copy")
-
-    record = {
-        **extract,
-        **explain,
-        "file_name": file_name,
-        "document_id": doc_meta.get("document_id"),
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        "patient_id": str(resolve_patient_id(patient_id) or ""),
-    }
-    record = enrich_my_results_record(record) or record
-    try:
-        save_my_result_record(
-            patient_id,
-            record,
-            caregiver_name,
-            caregiver_id=caregiver_id,
-        )
-    except Exception:
-        _my_results_logger.exception("Failed to persist My Results analysis to shift log")
-    return record
+    return _finalize_my_results_record(
+        {**extract, **explain},
+        patient_id=patient_id,
+        file_name=file_name,
+        raw_text=raw_text,
+        caregiver_name=caregiver_name,
+        caregiver_id=caregiver_id,
+    )
 
 
 def build_sbar_results_html(result):
@@ -9006,7 +9491,36 @@ def build_sbar_results_html(result):
             </div>
             """
 
+    peak_severity = str(result.get("peak_severity") or "").strip().lower()
+    peak_severity_html = ""
+    if peak_severity in ("emergency", "contact_doctor"):
+        peak_label = handover_severity_label(peak_severity)
+        peak_detail = (
+            "Call 999/112 was recommended during this period."
+            if peak_severity == "emergency"
+            else "GP/consultant contact within 24 hours was recommended during this period."
+        )
+        peak_class = "cs-sbar-peak-emergency" if peak_severity == "emergency" else "cs-sbar-peak-contact"
+        peak_severity_html = (
+            f'<div class="cs-sbar-peak {peak_class}">'
+            f'<div class="cs-sbar-peak-label">Peak severity this period</div>'
+            f'<div class="cs-sbar-peak-value">{html.escape(peak_label)}</div>'
+            f'<div class="cs-sbar-peak-detail">{html.escape(peak_detail)}</div>'
+            f"</div>"
+        )
+    photo_count = int(result.get("photo_report_count") or 0)
+    photo_note_html = ""
+    if photo_count > 0:
+        photo_note_html = (
+            f'<div class="cs-sbar-photo-note">'
+            f"{photo_count} symptom photo{'s' if photo_count != 1 else ''} logged this period "
+            f"— included in the downloadable PDF."
+            f"</div>"
+        )
+
     return f"""
+    {peak_severity_html}
+    {photo_note_html}
     <div class="cs-sbar-grid">
       <div class="cs-sbar-card cs-sbar-situation">
         <div class="cs-sbar-label">Situation</div>
@@ -9033,59 +9547,91 @@ def build_sbar_results_html(result):
     """
 
 
-def build_reported_by_card_html(caregiver: str, note: str) -> str:
+def build_reported_by_card_html(caregiver: str, note: str, image_b64: str = "") -> str:
     name = html.escape(caregiver)
     body = html.escape(note)
+    image_html = ""
+    if image_b64:
+        image_html = (
+            f'<img src="data:image/jpeg;base64,{image_b64}" '
+            'style="max-width:100%;max-height:220px;border-radius:8px;margin-top:10px;" '
+            'alt="Symptom photo" />'
+        )
     return (
         '<div style="background-color: #E8F5E9; padding: 15px; border-radius: 10px; '
         'margin-bottom: 10px; border-left: 5px solid #2E7D32;">'
         f'<strong style="color: #1B5E20; font-size: 16px;">{name}:</strong>'
         f'<p style="color: #2E7D32; margin: 5px 0 0 0;">{body}</p>'
+        f'{image_html}'
         '</div>'
     )
 
 
-def render_paginated_reported_by(reported_by: list) -> None:
+def render_handover_symptom_photos(patient_id, period_key: str, tz_obj) -> None:
+    """Show every symptom photo logged in the selected handover period."""
+    reviews = get_handover_photo_reviews_for_period(patient_id, period_key, tz_obj)
+    if not reviews:
+        return
+    md_html('<div class="cs-reported-by-heading">Symptom photos in this period</div>')
+    row_size = 3
+    for row_start in range(0, len(reviews), row_size):
+        cols = st.columns(row_size)
+        for col_idx, review in enumerate(reviews[row_start:row_start + row_size]):
+            image_b64 = review.get("image_b64")
+            if not image_b64:
+                continue
+            caption = (
+                f"{review.get('timestamp_display') or 'Unknown time'} · "
+                f"{review.get('caregiver') or 'Caregiver'}"
+            )
+            with cols[col_idx]:
+                st.image(
+                    f"data:image/jpeg;base64,{image_b64}",
+                    caption=caption,
+                    use_container_width=True,
+                )
+
+
+def render_paginated_reported_by(
+    reported_by: list,
+    *,
+    heading: str = "Things reported",
+    session_key: str = "handover_reported_by_visible",
+    show_more_key: str = "handover_reported_by_show_more",
+    show_less_key: str = "handover_reported_by_show_less",
+) -> None:
     if not reported_by:
         return
 
-    session_key = "handover_reported_by_visible"
     if session_key not in st.session_state:
         st.session_state[session_key] = HANDOVER_TIMELINE_DEFAULT_VISIBLE
 
     total = len(reported_by)
     shown_count = min(st.session_state[session_key], total)
-    visible_entries = reported_by[:shown_count]
-    hidden_count = total - shown_count
+    start_idx = max(0, total - shown_count)
+    visible_entries = reported_by[start_idx:]
+    hidden_count = start_idx
 
-    md_html('<div class="cs-reported-by-heading">Reported by</div>')
+    md_html(f'<div class="cs-reported-by-heading">{html.escape(heading)}</div>')
     for entry in visible_entries:
         caregiver = str(entry.get("caregiver", "Caregiver"))
         note = str(entry.get("note", ""))
+        image_b64 = str(entry.get("image_b64") or "")
         st.markdown(
-            build_reported_by_card_html(caregiver, note),
+            build_reported_by_card_html(caregiver, note, image_b64=image_b64),
             unsafe_allow_html=True,
         )
 
     if hidden_count > 0:
         md_html('<div class="cs-timeline-more-indicator">···</div>')
 
-    if hidden_count > 0 or shown_count > HANDOVER_TIMELINE_DEFAULT_VISIBLE:
-        btn_left, btn_right = st.columns(2)
-        if hidden_count > 0:
-            batch = min(HANDOVER_TIMELINE_EXPAND_BATCH, hidden_count)
-            with btn_left:
-                if st.button(f"Show {batch} more", key="handover_reported_by_show_more"):
-                    st.session_state[session_key] = shown_count + batch
-                    st.rerun()
-        if shown_count > HANDOVER_TIMELINE_DEFAULT_VISIBLE:
-            with btn_right if hidden_count > 0 else btn_left:
-                if st.button("Show less", key="handover_reported_by_show_less"):
-                    st.session_state[session_key] = max(
-                        HANDOVER_TIMELINE_DEFAULT_VISIBLE,
-                        shown_count - HANDOVER_TIMELINE_EXPAND_BATCH,
-                    )
-                    st.rerun()
+    render_history_show_more_controls(
+        hidden_count=hidden_count,
+        total=total,
+        shown_count=shown_count,
+        session_key=session_key,
+        show_more_key=show_more_key,
+    )
 
 
 def format_plan_timestamp(value: str) -> str:
@@ -9205,13 +9751,17 @@ def build_stored_conditions_sbar_html(conditions):
     blocks = []
     for item in conditions or []:
         badge_class, badge_label = condition_badge_meta(item["badge"])
+        since_html = ""
+        since_label = normalize_condition_since(item.get("since"))
+        if since_label:
+            since_html = f'<div class="cs-doc-item-detail">{html.escape(since_label)}</div>'
         blocks.append(
             f'<div class="cs-doc-item-block">'
             f'<div class="cs-doc-condition-top">'
             f'<span class="cs-doc-item-name">{html.escape(item["name"])}</span>'
             f'<span class="cs-badge {badge_class}">{badge_label}</span>'
             f'</div>'
-            f'<div class="cs-doc-item-detail">{html.escape(item["since"])}</div>'
+            f'{since_html}'
             f'</div>'
         )
     if not blocks:
@@ -11290,6 +11840,49 @@ div[data-testid="column"]:has(.cs-home-back-anchor) [data-testid="stButton"] but
     color: var(--cs-text);
     font-family: 'DM Sans', sans-serif;
 }
+.cs-sbar-peak {
+    border-radius: 16px;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+    font-family: 'DM Sans', sans-serif;
+}
+.cs-sbar-peak-emergency {
+    background: #FEE2E2;
+    border: 1px solid #FCA5A5;
+}
+.cs-sbar-peak-contact {
+    background: #FFEDD5;
+    border: 1px solid #FDBA74;
+}
+.cs-sbar-peak-label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #7F1D1D;
+    margin-bottom: 6px;
+}
+.cs-sbar-peak-value {
+    font-size: 20px;
+    font-weight: 800;
+    color: #991B1B;
+    margin-bottom: 4px;
+}
+.cs-sbar-peak-contact .cs-sbar-peak-value { color: #9A3412; }
+.cs-sbar-peak-detail {
+    font-size: 14px;
+    color: #7F1D1D;
+}
+.cs-sbar-photo-note {
+    background: #F0FDF4;
+    border: 1px solid #BBF7D0;
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    color: #166534;
+    font-family: 'DM Sans', sans-serif;
+}
 .cs-reported-by-heading {
     font-family: 'DM Sans', sans-serif;
     font-size: 18px;
@@ -12158,6 +12751,36 @@ div[data-testid="stInfo"] {
     padding: 12px 14px 12px 16px;
     cursor: pointer;
     list-style: none;
+}
+.cs-medcam-pill-row-summary-inner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    flex: 1;
+}
+.cs-medcam-pill-row-ref-thumb {
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    object-fit: cover;
+    flex-shrink: 0;
+    border: 2px solid #FFFFFF;
+    box-shadow: 0 2px 6px rgba(26, 43, 35, 0.1);
+}
+@media (max-width: 480px) {
+    .cs-medcam-pill-row-ref-thumb {
+        width: 44px;
+        height: 44px;
+        border-radius: 8px;
+    }
+    .cs-medcam-pill-row-summary {
+        padding: 10px 12px 10px 14px;
+        gap: 8px;
+    }
+    .cs-medcam-pill-row-summary-inner {
+        gap: 10px;
+    }
 }
 .cs-medcam-pill-row-summary::-webkit-details-marker {
     display: none;
@@ -13826,6 +14449,12 @@ with tab_docs:
     with st.container(border=True):
         md_html('<div class="cs-doc-upload-panel"></div>')
 
+        active_patient_name = get_patient_display_name(get_current_patient_id())
+        st.warning(
+            "Please upload a document that belongs to and matches the active profile "
+            f"({active_patient_name}). Documents for another patient will not be saved."
+        )
+
         if st.session_state.get("doc_patient_mismatch_warning"):
             st.warning(st.session_state["doc_patient_mismatch_warning"])
 
@@ -14002,12 +14631,13 @@ with tab_docs:
 # ════════════════════════════════════════════════════════════════
 with tab_report:
     patient_id = get_current_patient_id()
-    hydrate_key = f"care_hydrated_{patient_id}"
+    hydrate_key = care_hydrate_key(patient_id)
     if patient_id and not st.session_state.get(hydrate_key):
         hydrate_patient_care_session(patient_id, selected_caregiver)
 
     if "messages" not in st.session_state:
         st.session_state.messages = build_initial_chat_messages(selected_caregiver)
+        st.session_state.report_ask_bound_caregiver_id = selected_caregiver_id
     if "chat_caregiver" not in st.session_state:
         st.session_state.chat_caregiver = selected_caregiver
     if "chat_caregiver_id" not in st.session_state:
@@ -14016,15 +14646,17 @@ with tab_report:
         st.session_state.chat_draft = ""
     if "chat_photo_uploader_key" not in st.session_state:
         st.session_state.chat_photo_uploader_key = 0
+    if "chat_report_history_visible" not in st.session_state:
+        st.session_state.chat_report_history_visible = CHAT_REPORT_HISTORY_DEFAULT_VISIBLE
 
-    if st.session_state.chat_caregiver_id != selected_caregiver_id:
-        st.session_state.chat_caregiver_id = selected_caregiver_id
-        st.session_state.chat_caregiver = selected_caregiver
-        refresh_chat_welcome_message(selected_caregiver)
-        st.session_state.reset_chat_draft = True
-        st.session_state.pop("pending_chat_response", None)
-    elif not st.session_state.messages:
-        st.session_state.messages = build_initial_chat_messages(selected_caregiver)
+    bound_caregiver_id = st.session_state.get("report_ask_bound_caregiver_id")
+    if report_ask_needs_caregiver_reset(selected_caregiver_id, st.session_state.get("messages")):
+        reset_report_ask_for_caregiver_switch(
+            patient_id,
+            selected_caregiver,
+            selected_caregiver_id,
+            previous_caregiver_id=bound_caregiver_id,
+        )
     else:
         refresh_chat_welcome_message(selected_caregiver)
 
@@ -14052,12 +14684,29 @@ with tab_report:
 
     with st.container(border=True):
         chat_plan_items = get_active_plan_items()
+        visible_report_count = st.session_state.get(
+            "chat_report_history_visible",
+            CHAT_REPORT_HISTORY_DEFAULT_VISIBLE,
+        )
+        visible_messages, hidden_report_count, total_report_count = slice_messages_for_report_history(
+            st.session_state.messages,
+            visible_report_count,
+        )
         st.markdown(
             render_chat_messages_html(
-                st.session_state.messages,
+                visible_messages,
                 selected_caregiver,
             ),
             unsafe_allow_html=True,
+        )
+        render_history_show_more_controls(
+            hidden_count=hidden_report_count,
+            total=total_report_count,
+            shown_count=min(visible_report_count, total_report_count),
+            session_key="chat_report_history_visible",
+            show_more_key="chat_report_history_show_more",
+            batch=CHAT_REPORT_HISTORY_EXPAND_BATCH,
+            default_visible=CHAT_REPORT_HISTORY_DEFAULT_VISIBLE,
         )
         render_chat_auto_scroll()
         st.text_input(
@@ -14095,6 +14744,7 @@ with tab_report:
                 "has_image": bool(image_b64),
                 "timestamp": reported_at,
                 "timestamp_display": timestamp_display,
+                "caregiver_id": selected_caregiver_id,
             })
             st.session_state.pending_chat_response = {
                 "text": text,
@@ -14278,6 +14928,7 @@ with tab_medcam:
                     last_result["log_time"],
                     ai_result=last_result.get("ai_result"),
                     absence_warnings=last_result.get("absence_warnings"),
+                    med_refs=load_live_medication_references(resolved_patient_id),
                 ))
 
             audit_records = get_medcam_audit_records(st.session_state.selected_patient_id)
@@ -14296,7 +14947,7 @@ with tab_medcam:
 # ════════════════════════════════════════════════════════════════
 with tab_handover:
     handover_patient_id = get_current_patient_id()
-    if handover_patient_id and not st.session_state.get(f"care_hydrated_{handover_patient_id}"):
+    if handover_patient_id and not st.session_state.get(care_hydrate_key(handover_patient_id)):
         hydrate_patient_care_session(handover_patient_id, selected_caregiver)
 
     if "last_sbar_result" not in st.session_state:
@@ -14349,17 +15000,38 @@ with tab_handover:
                 if result.get("error"):
                     st.error(result["message"])
                 else:
-                    st.session_state.last_sbar_result = merge_pending_handover_questions(
+                    symptom_events_for_report = attach_timeline_event_photos(
+                        symptom_events,
                         patient_id,
-                        result,
                     )
-                    st.session_state.handover_reported_by_visible = HANDOVER_TIMELINE_DEFAULT_VISIBLE
+                    enriched = enrich_handover_result_with_period_entries(
+                        merge_pending_handover_questions(
+                            patient_id,
+                            result,
+                        ),
+                        symptom_events_for_report,
+                        adherence_events,
+                    )
+                    st.session_state.last_sbar_result = enriched
                     st.rerun()
 
         if st.session_state.last_sbar_result:
             result = st.session_state.last_sbar_result
             md_html(build_sbar_results_html(result))
-            render_paginated_reported_by(result.get("reported_by", []))
+            sbar_reported = result.get("reported_by") or []
+            if sbar_reported:
+                render_paginated_reported_by(
+                    sbar_reported,
+                    heading="Reported by",
+                    session_key="handover_reported_by_visible",
+                    show_more_key="handover_reported_by_show_more",
+                    show_less_key="handover_reported_by_show_less",
+                )
+            render_handover_symptom_photos(
+                st.session_state.get("selected_patient_id"),
+                period_key,
+                tz_obj,
+            )
 
             pdf_bytes = get_handover_pdf_bytes(
                 st.session_state.get("selected_patient_id"),

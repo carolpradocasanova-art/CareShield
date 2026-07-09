@@ -98,3 +98,55 @@ def test_build_sbar_handover_user_payload_notes_missing_symptoms():
     assert "None logged in this period" in payload
     assert "Hydralazine dose missed" in payload
 
+
+def test_build_sbar_handover_user_payload_includes_photos_and_peak_severity():
+    symptom = [
+        {
+            "timestamp": "2026-07-09T10:00:00+00:00",
+            "text": "Bruising on left leg",
+            "source": "symptom_photo",
+            "severity": "contact_doctor",
+            "caregiver": "Carolina",
+            "has_photo": True,
+            "photo_finding": "concern",
+        },
+        {
+            "timestamp": "2026-07-09T11:00:00+00:00",
+            "text": "Susan had a fall and bumped her head",
+            "source": "voice_report",
+            "severity": "contact_doctor",
+            "caregiver": "Carolina",
+        },
+        {
+            "timestamp": "2026-07-09T11:30:00+00:00",
+            "text": "Susan had a fall and bumped her head — worsening",
+            "source": "voice_report",
+            "severity": "emergency",
+            "caregiver": "Carolina",
+        },
+    ]
+    payload = build_sbar_handover_user_payload(symptom, [])
+    assert "SYMPTOM PHOTOS LOGGED" in payload
+    assert "Bruising on left leg" in payload
+    assert "PEAK SEVERITY REACHED IN THIS PERIOD: EMERGENCY" in payload
+    assert "[EMERGENCY]" in payload
+    assert payload.count("Susan had a fall") == 2
+
+
+def test_merge_sbar_events_keeps_highest_severity_for_duplicate_key():
+    first = {
+        "timestamp": "2026-07-09T11:00:00+00:00",
+        "text": "Fall with head bump",
+        "severity": "contact_doctor",
+        "source": "voice_report",
+    }
+    second = {
+        "timestamp": "2026-07-09T11:00:00+00:00",
+        "text": "Fall with head bump",
+        "severity": "emergency",
+        "source": "voice_report",
+    }
+    merged = merge_sbar_events([first, second])
+    assert len(merged) == 1
+    assert merged[0]["severity"] == "emergency"
+

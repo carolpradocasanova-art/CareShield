@@ -9,6 +9,9 @@ from ai_helpers import (
     MY_RESULTS_EXPLAIN_PROMPT,
     MY_RESULTS_EXTRACT_PROMPT,
     MY_RESULTS_DATE_NOT_SPECIFIED,
+    ai_failure_is_recoverable_offline,
+    build_my_results_record_from_offline_text,
+    classify_ai_failure_error,
     build_my_results_explain_payload,
     count_my_results_review_items,
     enrich_my_results_record,
@@ -469,6 +472,42 @@ class MyResultsLogicTests(unittest.TestCase):
             }),
             "Good news",
         )
+
+
+class MyResultsOfflineFallbackTests(unittest.TestCase):
+    def test_classify_ai_failure_detects_quota_error(self):
+        details = (
+            "Error code: 429 - {'error': {'message': 'You exceeded your current quota', "
+            "'type': 'insufficient_quota', 'code': 'insufficient_quota'}}"
+        )
+        self.assertEqual(classify_ai_failure_error(details), "quota_exceeded")
+        self.assertTrue(ai_failure_is_recoverable_offline("quota_exceeded"))
+
+    def test_offline_cardiology_letter_produces_actionable_record(self):
+        letter_text = """
+        Riverside Cardiology Clinic
+        12 March 2026
+
+        Re: Susan Clarke
+
+        Diagnosis: new onset atrial fibrillation.
+        Start Furosemide 20 mg daily and Apixaban 5 mg twice daily.
+        Seek urgent care for chest pain, severe breathlessness, or fainting.
+        Follow-up clinic visit in 3 weeks.
+        Echocardiogram on 26 March 2026.
+        """
+        record = build_my_results_record_from_offline_text(
+            letter_text,
+            file_name="Susan_Clarke_Cardiology_Followup_Letter.pdf",
+            patient_name="Susan Clarke",
+            known_conditions=["Hypertension"],
+        )
+        self.assertIsNotNone(record)
+        self.assertTrue(my_results_has_actionable_content(record))
+        self.assertTrue(my_results_explain_is_complete(record, record))
+        self.assertIn("Cardiology", record.get("documentType", ""))
+        self.assertTrue(record.get("medicationChanges"))
+        self.assertTrue(record.get("followUps"))
 
 
 if __name__ == "__main__":
